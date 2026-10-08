@@ -1,4 +1,4 @@
-From c042ff770882f34ea4c6343ffd0be4083e2be740 Mon Sep 17 00:00:00 2001
+From 96a53195f6ae3e07815c0bf72bbf3bbbf8a714b6 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 8 Oct 2026 20:30:20 +0000
 Subject: [PATCH] feat(dlssnr): denoise first with display-resolution motion
@@ -38,9 +38,9 @@ Claude-Session: https://claude.ai/code/session_01KksEgLpWVJEmw2R46xQgz1
  .../dlssnr_motion_downscale_Shader.h          | 129 +++++++++
  docs/NR-MOTION-METADATA.md                    |  11 +
  .../nr_denoise_first_display_motion_unit.cpp  | 214 ++++++++++++++
- .../nr_denoise_first_display_motion_warp.cpp  | 270 ++++++++++++++++++
+ .../nr_denoise_first_display_motion_warp.cpp  | 273 ++++++++++++++++++
  tests/run_nr_denoise_first_display_motion.ps1 |  14 +
- 14 files changed, 919 insertions(+), 21 deletions(-)
+ 14 files changed, 922 insertions(+), 21 deletions(-)
  create mode 100644 OptiScaler/shaders/dlssnr/DlssNr_DisplayMotion.h
  create mode 100644 OptiScaler/shaders/dlssnr/precompile/dlssnr_motion_downscale.hlsl
  create mode 100644 OptiScaler/shaders/dlssnr/precompile/dlssnr_motion_downscale_Shader.cso
@@ -471,7 +471,7 @@ index d1c8a0d..de21a25 100644
                  if (device)
 diff --git a/OptiScaler/shaders/dlssnr/precompile/dlssnr_motion_downscale.hlsl b/OptiScaler/shaders/dlssnr/precompile/dlssnr_motion_downscale.hlsl
 new file mode 100644
-index 0000000..bf408f6
+index 0000000..41cc7f5
 --- /dev/null
 +++ b/OptiScaler/shaders/dlssnr/precompile/dlssnr_motion_downscale.hlsl
 @@ -0,0 +1,74 @@
@@ -544,8 +544,8 @@ index 0000000..bf408f6
 +    const uint2 source = uint2(SourceTexel(id.x, gWidth, gGuideWidth, gResidualMotionBaseX),
 +                               SourceTexel(id.y, gHeight, gGuideHeight, gResidualMotionBaseY));
 +    const float2 motion = gMotion.Load(int3(source, 0)).xy * float2(gMvScaleX, gMvScaleY);
-+    // NaN/Inf become zero motion. Tested on the exponent bits: isfinite() may be folded away under
-+    // the compiler's or driver's fast-math assumptions (observed on WARP).
++    // NaN/Inf become zero motion. Tested on the exponent bits so that fast-math compilation (DXC
++    // or the driver) cannot remove the guard.
 +    const uint2 exponent = asuint(motion) & 0x7f800000u;
 +    gTarget[id.xy] = all(exponent != 0x7f800000u) ? motion : float2(0.0, 0.0);
 +}
@@ -973,10 +973,10 @@ index 0000000..bc7523e
 +}
 diff --git a/tests/nr_denoise_first_display_motion_warp.cpp b/tests/nr_denoise_first_display_motion_warp.cpp
 new file mode 100644
-index 0000000..533b4b9
+index 0000000..c1c31ff
 --- /dev/null
 +++ b/tests/nr_denoise_first_display_motion_warp.cpp
-@@ -0,0 +1,270 @@
+@@ -0,0 +1,273 @@
 +// WARP executes the shipped dlssnr_motion_downscale DXIL. No game or NVIDIA runtime.
 +// Run: tests/run_nr_denoise_first_display_motion.ps1
 +#ifndef NOMINMAX
@@ -1211,7 +1211,10 @@ index 0000000..533b4b9
 +                const auto m = field(x + 0.5f, y + 0.5f);
 +                display[(y + baseY) * padW + x + baseX] = { m.x / scaleX, m.y / scaleY };
 +            }
-+        display[baseY * padW + baseX] = { std::numeric_limits<float>::quiet_NaN(), 1 };
++        // A corrupt vector on the texel render pixel (0,0) reads (texel 1 at Performance and below).
++        const auto nanX = DlssNr::DisplayMotionSourceTexel(0, render.width, outW, baseX);
++        const auto nanY = DlssNr::DisplayMotionSourceTexel(0, render.height, outH, baseY);
++        display[nanY * padW + nanX] = { std::numeric_limits<float>::quiet_NaN(), 1 };
 +        const auto plan =
 +            DlssNr::PlanDenoiseFirstMotion(false, { padW, padH }, baseX, baseY, render, { outW, outH }, scaleX, scaleY);
 +        expect(plan.valid && !plan.passthrough, "plan rejected a valid display-resolution frame");
