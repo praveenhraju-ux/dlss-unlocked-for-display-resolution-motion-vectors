@@ -97,8 +97,19 @@ jobs:
       - name: Collect binaries
         shell: pwsh
         run: |
+          # Upstream's output folder is x64/Release/a; fall back to wherever MSBuild put the DLL.
           $src = 'optiscaler/x64/Release/a'
-          if (-not (Test-Path "$src/OptiScaler.dll")) { throw "OptiScaler.dll not produced in $src" }
+          if (-not (Test-Path "$src/OptiScaler.dll")) {
+            Get-ChildItem optiscaler -Recurse -Filter OptiScaler.dll -File |
+              Where-Object { $_.FullName -notmatch '\\external\\' } |
+              ForEach-Object { Write-Host "found: $($_.FullName) ($($_.Length) bytes, $($_.LastWriteTime))" }
+            $dll = Get-ChildItem optiscaler -Recurse -Filter OptiScaler.dll -File |
+              Where-Object { $_.FullName -notmatch '\\external\\' } |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if (-not $dll) { throw 'OptiScaler.dll was not produced by the build' }
+            $src = $dll.DirectoryName
+          }
+          Write-Host "Collecting from $src"
           $out = 'artifact'
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           Copy-Item "$src/*" $out -Recurse -Force
