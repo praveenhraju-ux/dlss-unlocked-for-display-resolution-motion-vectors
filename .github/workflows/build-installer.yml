@@ -448,8 +448,15 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  build-installer:
+  # OptiScaler.dll with the DLSS-NR Denoise First display-resolution motion-vector patch
+  # (OptiScaler-patches/). Built from source; replaces the DLL from the upstream release zip.
+  patched-optiscaler:
     needs: check-versions
+    if: needs.check-versions.outputs.should_build_nightly == 'true' || needs.check-versions.outputs.should_build_latest == 'true'
+    uses: ./.github/workflows/build-optiscaler-patched.yml
+
+  build-installer:
+    needs: [check-versions, patched-optiscaler]
     if: needs.check-versions.outputs.should_build_nightly == 'true' || needs.check-versions.outputs.should_build_latest == 'true'
     runs-on: windows-latest
     strategy:
@@ -738,6 +745,31 @@ jobs:
         if ($targetHash) {
             Set-Content -Path $hashFile -Value $targetHash -Encoding ASCII
             Write-Host "Saved OptiScaler asset hash ($targetHash) to $hashFile"
+        }
+
+    - name: Download patched OptiScaler.dll
+      if: (matrix.build_type == 'nightly' && needs.check-versions.outputs.should_build_nightly == 'true') || (matrix.build_type == 'latest' && needs.check-versions.outputs.should_build_latest == 'true')
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ needs.patched-optiscaler.outputs.artifact }}
+        path: patched-optiscaler
+
+    - name: Use patched OptiScaler.dll (Denoise First display-resolution motion vectors)
+      if: (matrix.build_type == 'nightly' && needs.check-versions.outputs.should_build_nightly == 'true') || (matrix.build_type == 'latest' && needs.check-versions.outputs.should_build_latest == 'true')
+      shell: powershell
+      run: |
+        $version = "${{ matrix.build_type == 'nightly' && needs.check-versions.outputs.nightly_version || needs.check-versions.outputs.latest_version }}"
+        $baseTag = "${{ needs.patched-optiscaler.outputs.base_tag }}"
+        # The patched DLL must come from the same OptiScaler release as the rest of the package
+        # (OptiScaler.ini, companion DLLs); never mix versions.
+        if ($version.Trim().TrimStart('v') -ne $baseTag.Trim().TrimStart('v')) {
+            throw "OptiScaler $version does not match the patched build ($baseTag). Rebase OptiScaler-patches/ onto $version (and OPTISCALER_TAG/OPTISCALER_REF in build-optiscaler-patched.yml), or run with optiscaler_version=$baseTag."
+        }
+        $dll = "patched-optiscaler\OptiScaler.dll"
+        if (-not (Test-Path $dll)) { throw "Patched OptiScaler.dll missing from the artifact" }
+        foreach ($target in @("Dll version\OptiScaler.dll", "Dll version\dlss-unlocked-upscaler.dll")) {
+            Copy-Item -Path $dll -Destination $target -Force
+            Write-Host "$target <- patched OptiScaler.dll ($((Get-FileHash $target -Algorithm SHA256).Hash))"
         }
 
     - name: Cache NVIDIA Streamline
@@ -1415,6 +1447,9 @@ jobs:
         body: |
           🚀 **DLSS Unlocked** - ${{ steps.release_meta.outputs.display_type }} (${{ steps.release_meta.outputs.effective_tag }}) with OptiScaler-DLSSNR-PreSR-Multipass ${{ matrix.build_type == 'nightly' && needs.check-versions.outputs.nightly_version || needs.check-versions.outputs.latest_version }}
           
+          ## 🧠 DLSS-NR Denoise First with display-resolution motion vectors
+          `OptiScaler.dll` in this release is built from OptiScaler-DLSSNR-PreSR-Multipass ${{ needs.patched-optiscaler.outputs.base_tag }} plus this fork's patch (`OptiScaler-patches/`): DLSS-NR **Denoise First** (`[DlssNr] DenoiseFirst=true`, DX12) now also runs in games that give DLSS display-resolution motion vectors (e.g. Stellar Blade). They are resampled to render resolution for the private 1:1 pass and NR; the game's own DLSS upscale is untouched. Works with every DLSS mode: DLAA, Quality, Balanced, Performance and Ultra Performance.
+
           ## 📦 What's Included
           - **Automated Setup (`.exe`)**: `dlss-unlocked-setup-${{ steps.release_meta.outputs.effective_tag }}.exe` — All-in-one installer that configures and deploys `dxgi.dll` (or `version.dll`), OptiScaler-DLSSNR-PreSR-Multipass, native Turing/Ampere DLSS MFG (`dlssg_sm86`), DLSS Enabler companion, DLSSG-to-FSR3, NVIDIA Streamline 2.14.1, and NVIDIA runtime components.
           - **Standalone Archive (`.zip`)**: `dlss-unlocked-standalone-${{ steps.release_meta.outputs.effective_tag }}.zip` — Contains standalone `dxgi.dll` (rename to `version.dll` if using ReShade), `OptiScaler.ini`, `nvngx.dll_dlssnr.dll`, patched `nvngx_dlssnr.dll`, `OptiScaler/dlssg_sm86/` native MFG unlocker, and companion modules.

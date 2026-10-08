@@ -2,7 +2,8 @@
 
 `0001-feat-dlssnr-denoise-first-with-display-resolution-mo.patch` applies to
 [ShyVortex/OptiScaler-DLSSNR-PreSR-Multipass](https://github.com/ShyVortex/OptiScaler-DLSSNR-PreSR-Multipass)
-at `36ef958381a9ed44d06fc9e6606b41e2d99de3e2`.
+at release `v0.9.50` (`d5fa05cb92e9667b648d120e9d9b65e09bd2370a`). That is the OptiScaler backend of DLSS Unlocked
+[`NR-v0.9.50-hotfix`](https://github.com/ShyVortex/dlss-unlocked/releases/tag/NR-v0.9.50-hotfix), which this fork is based on.
 
 ## What it changes
 
@@ -22,6 +23,9 @@ the private 1:1 DLSS/RR pass, the private DLSS SR step (`DenoiseFirstStep=1`) an
   distance stay the same. Jitter offsets pass through unchanged.
 - The game's motion texture goes back to its declared resource state. The private copy is freed through the same
   GPU-lifetime retirement as the rest of the Denoise First generation.
+- Every DLSS mode works: DLAA, Quality, Balanced, Performance and Ultra Performance. The scale comes from each
+  frame's actual render and output sizes, so dynamic resolution works too. The tests cover all five modes at
+  1080p, 1440p and 4K.
 - The game's own DLSS upscale keeps its original motion vectors and parameters. Games that already supply
   render-resolution vectors take exactly the path they took before.
 
@@ -29,6 +33,21 @@ Files: `DlssNr_Dx12_DenoiseFirst.cpp`, new `DlssNr_DisplayMotion.h`, new shader 
 (DXIL compiled with dxc `cs_6_0`), plus `DlssNr_Dx12.{h,cpp}` and `DlssNr_Dx12_State.h`. Tests:
 `tests/nr_denoise_first_display_motion_unit.cpp` (headless) and `tests/nr_denoise_first_display_motion_warp.cpp`
 (runs the shipped shader on WARP).
+
+## Setup installer and release
+
+`build-installer.yml` builds the patched DLL through `build-optiscaler-patched.yml` and puts it in place of the
+upstream `OptiScaler.dll`, in both `setup.exe` and the standalone zip. It refuses to mix versions: the upstream
+OptiScaler release has to be the one the patch was built on (`v0.9.50`). To publish a release of this fork, run
+**Build DLSS-Unlocked Installer** from the Actions tab with:
+
+| input | value |
+|---|---|
+| build_action | `release` |
+| optiscaler_version | `v0.9.50` |
+| tag_name | `NR-v0.9.50-display-mv` |
+| release_type | `stable` |
+| force_build | `true` |
 
 ## Building
 
@@ -42,11 +61,11 @@ To build locally on Windows with Visual Studio 2022:
 ```powershell
 git clone --recurse-submodules https://github.com/ShyVortex/OptiScaler-DLSSNR-PreSR-Multipass optiscaler
 cd optiscaler
-git checkout 36ef958381a9ed44d06fc9e6606b41e2d99de3e2
+git checkout v0.9.50
 git submodule update --init
 git apply --whitespace=nowarn ..\OptiScaler-patches\0001-*.patch
 .\tests\run_nr_denoise_first_display_motion.ps1      # from a "x64 Native Tools" prompt
-msbuild /m /p:Configuration=Release .
+msbuild OptiScaler.sln /m /p:Configuration=Release /p:Platform=x64 /p:PostBuildEventUseInBuild=false
 # output: x64\Release\a\OptiScaler.dll
 ```
 
@@ -68,7 +87,7 @@ Only the OptiScaler proxy DLL changes. Every other DLSS Unlocked file stays as i
    ```
    Denoise First is not combined with `DeferredDLSS` or `FinishedPicture`. Turn those off, along with the debug
    view, Compare and Show skin mask.
-5. Start the game and select DLSS **Balanced** in its settings.
+5. Start the game and pick any DLSS mode (DLAA, Quality, Balanced, Performance or Ultra Performance).
 
 To revert, put the backed-up proxy DLL back.
 

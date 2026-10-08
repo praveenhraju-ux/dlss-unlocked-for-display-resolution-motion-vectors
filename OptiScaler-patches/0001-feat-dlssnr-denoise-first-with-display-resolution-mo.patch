@@ -1,6 +1,6 @@
-From 6f5951d68b0f8758da1b2a4b2435b2b61c8fc73a Mon Sep 17 00:00:00 2001
-From: praveenhraju-ux <praveenrajuh@gmail.com>
-Date: Thu, 8 Oct 2026 20:23:21 +0000
+From f91a40e595b746a102fea446e733cdf370effe18 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 8 Oct 2026 20:30:20 +0000
 Subject: [PATCH] feat(dlssnr): denoise first with display-resolution motion
  vectors (DX12)
 
@@ -37,10 +37,10 @@ Claude-Session: https://claude.ai/code/session_01KksEgLpWVJEmw2R46xQgz1
  .../dlssnr_motion_downscale_Shader.cso        | Bin 0 -> 2396 bytes
  .../dlssnr_motion_downscale_Shader.h          | 131 +++++++++
  docs/NR-MOTION-METADATA.md                    |  11 +
- .../nr_denoise_first_display_motion_unit.cpp  | 175 ++++++++++++
- .../nr_denoise_first_display_motion_warp.cpp  | 260 ++++++++++++++++++
+ .../nr_denoise_first_display_motion_unit.cpp  | 214 ++++++++++++++
+ .../nr_denoise_first_display_motion_warp.cpp  | 265 ++++++++++++++++++
  tests/run_nr_denoise_first_display_motion.ps1 |  14 +
- 14 files changed, 869 insertions(+), 21 deletions(-)
+ 14 files changed, 913 insertions(+), 21 deletions(-)
  create mode 100644 OptiScaler/shaders/dlssnr/DlssNr_DisplayMotion.h
  create mode 100644 OptiScaler/shaders/dlssnr/precompile/dlssnr_motion_downscale.hlsl
  create mode 100644 OptiScaler/shaders/dlssnr/precompile/dlssnr_motion_downscale_Shader.cso
@@ -752,10 +752,10 @@ index a83ce6b..78d8015 100644
 +`tests/nr_denoise_first_display_motion_unit.cpp` (headless) and `tests/nr_denoise_first_display_motion_warp.cpp` (runs the shipped DXIL on WARP) cover scale, direction, jitter, offsets, padding, passthrough and the texel pick.
 diff --git a/tests/nr_denoise_first_display_motion_unit.cpp b/tests/nr_denoise_first_display_motion_unit.cpp
 new file mode 100644
-index 0000000..b9a6e8f
+index 0000000..bc7523e
 --- /dev/null
 +++ b/tests/nr_denoise_first_display_motion_unit.cpp
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,214 @@
 +// Headless regression for denoise first with display-resolution motion vectors (no MVLowRes).
 +// No D3D12 or NVIDIA runtime; tests/nr_denoise_first_display_motion_warp.cpp runs the shader itself.
 +#include "../OptiScaler/shaders/dlssnr/DlssNr_DisplayMotion.h"
@@ -928,15 +928,54 @@ index 0000000..b9a6e8f
 +                assert(std::fabs(got.x / sx - expected.x) <= slack && std::fabs(got.y / sy - expected.y) <= slack);
 +            }
 +    }
++    // Every DLSS mode at 1080p, 1440p and 4K: DLAA, Quality, Balanced, Performance, Ultra Performance.
++    // Render sizes as NGX reports them (rounded output x ratio). The plan must accept each, the texel
++    // pick must stay in range, and a pan + rotation field (display pixels) must come back as the same
++    // on-screen motion in render pixels to within one display texel of the field's gradient.
++    for (const GuideExtent display : { GuideExtent { 1920, 1080 }, { 2560, 1440 }, { 3840, 2160 } })
++        for (const double ratio : { 1.0, 2.0 / 3.0, 0.58, 0.5, 1.0 / 3.0 })
++        {
++            const GuideExtent r { (unsigned) std::lround(display.width * ratio),
++                                  (unsigned) std::lround(display.height * ratio) };
++            const auto plan = PlanDenoiseFirstMotion(false, display, 0, 0, r, display, 1, 1);
++            assert(plan.valid && !plan.passthrough && plan.target.width == r.width && plan.target.height == r.height);
++            assert(Near(plan.bakeScaleX, float(r.width) / display.width) &&
++                   Near(plan.bakeScaleY, float(r.height) / display.height));
++            if (ratio == 1.0)
++                assert(plan.bakeScaleX == 1 && plan.bakeScaleY == 1); // DLAA: an exact copy
++            // A quarter-size sweep keeps the run short while hitting the same ratios.
++            const GuideExtent o { display.width / 4, display.height / 4 };
++            const GuideExtent rs { std::max(1u, (unsigned) std::lround(o.width * ratio)),
++                                   std::max(1u, (unsigned) std::lround(o.height * ratio)) };
++            const auto small = PlanDenoiseFirstMotion(false, o, 0, 0, rs, o, 1, 1);
++            assert(small.valid);
++            std::vector<Vec> field(o.width * o.height);
++            auto motionAt = [&](float px, float py)
++            { return Vec { 7.0f - 0.02f * (py - o.height * 0.5f), -2.5f + 0.02f * (px - o.width * 0.5f) }; };
++            for (unsigned y = 0; y < o.height; ++y)
++                for (unsigned x = 0; x < o.width; ++x)
++                    field[y * o.width + x] = motionAt(x + 0.5f, y + 0.5f);
++            const auto out = Resample(field, o.width, small);
++            const float sx = float(rs.width) / o.width, sy = float(rs.height) / o.height;
++            for (unsigned y = 0; y < rs.height; ++y)
++                for (unsigned x = 0; x < rs.width; ++x)
++                {
++                    const auto expected = motionAt((x + 0.5f) / sx, (y + 0.5f) / sy);
++                    const auto got = out[y * rs.width + x];
++                    assert(std::fabs(got.x / sx - expected.x) <= 0.021f &&
++                           std::fabs(got.y / sy - expected.y) <= 0.021f);
++                }
++        }
++
 +    std::puts("PASS: denoise first display-resolution motion (scale, direction, jitter, offsets, passthrough, "
-+              "texel selection, synthetic field)");
++              "texel selection, synthetic field, DLAA/Quality/Balanced/Performance/Ultra Performance)");
 +}
 diff --git a/tests/nr_denoise_first_display_motion_warp.cpp b/tests/nr_denoise_first_display_motion_warp.cpp
 new file mode 100644
-index 0000000..7cdac67
+index 0000000..8a6c068
 --- /dev/null
 +++ b/tests/nr_denoise_first_display_motion_warp.cpp
-@@ -0,0 +1,260 @@
+@@ -0,0 +1,265 @@
 +// WARP executes the shipped dlssnr_motion_downscale DXIL. No game or NVIDIA runtime.
 +// Run: tests/run_nr_denoise_first_display_motion.ps1
 +#define NOMINMAX
@@ -1146,50 +1185,55 @@ index 0000000..7cdac67
 +        return out;
 +    };
 +
-+    // Stellar Blade-shaped case at reduced size (Balanced 58%), padded allocation with an origin,
-+    // a pan + rotation field in display pixels, and an engine-style negative Y scale.
++    // Every DLSS mode (DLAA, Quality, Balanced, Performance, Ultra Performance) at reduced size,
++    // padded allocation with an origin, a pan + rotation field in display pixels, and an
++    // engine-style negative Y scale.
 +    const unsigned outW = 768, outH = 432, padW = 800, padH = 448, baseX = 16, baseY = 8;
-+    const DlssNr::GuideExtent render { 445, 251 };
-+    std::vector<Vec> display(padW * padH, Vec { 1e6f, 1e6f }); // padding must never be read
-+    const float scaleX = 2.0f, scaleY = -0.5f;                 // raw value * scale = display pixels
-+    auto field = [&](float px, float py)
++    for (const double ratio : { 1.0, 2.0 / 3.0, 0.58, 0.5, 1.0 / 3.0 })
 +    {
-+        const float cx = px - outW * 0.5f, cy = py - outH * 0.5f;
-+        return Vec { 12.5f - 0.01f * cy, -3.25f + 0.01f * cx };
-+    };
-+    for (unsigned y = 0; y < outH; ++y)
-+        for (unsigned x = 0; x < outW; ++x)
++        const DlssNr::GuideExtent render { (unsigned) std::lround(outW * ratio), (unsigned) std::lround(outH * ratio) };
++        std::vector<Vec> display(padW * padH, Vec { 1e6f, 1e6f }); // padding must never be read
++        const float scaleX = 2.0f, scaleY = -0.5f;                 // raw value * scale = display pixels
++        auto field = [&](float px, float py)
 +        {
-+            const auto m = field(x + 0.5f, y + 0.5f);
-+            display[(y + baseY) * padW + x + baseX] = { m.x / scaleX, m.y / scaleY };
-+        }
-+    display[baseY * padW + baseX] = { std::numeric_limits<float>::quiet_NaN(), 1 };
-+    const auto plan =
-+        DlssNr::PlanDenoiseFirstMotion(false, { padW, padH }, baseX, baseY, render, { outW, outH }, scaleX, scaleY);
-+    expect(plan.valid && !plan.passthrough, "plan rejected a valid display-resolution frame");
-+    const auto out = run(display, padW, padH, plan);
-+    expect(out[0].x == 0 && out[0].y == 0, "non-finite motion was not cleared");
-+    const float sx = float(render.width) / outW, sy = float(render.height) / outH;
-+    for (unsigned y = 0; y < render.height; ++y)
-+        for (unsigned x = 0; x < render.width; ++x)
-+        {
-+            if (!x && !y)
-+                continue;
-+            const auto got = out[y * render.width + x];
-+            expect(std::fabs(got.x) < 1000 && std::fabs(got.y) < 1000, "padding outside the region was read");
-+            // Bit-for-bit agreement with the CPU model of the texel pick and scale.
-+            const auto tx = DlssNr::DisplayMotionSourceTexel(x, render.width, outW, baseX);
-+            const auto ty = DlssNr::DisplayMotionSourceTexel(y, render.height, outH, baseY);
-+            const auto raw = display[ty * padW + tx];
-+            expect(std::fabs(got.x - raw.x * plan.bakeScaleX) <= 1e-4f * std::max(1.0f, std::fabs(got.x)) &&
-+                       std::fabs(got.y - raw.y * plan.bakeScaleY) <= 1e-4f * std::max(1.0f, std::fabs(got.y)),
-+                   "shader texel pick or scale differs from DlssNr_DisplayMotion.h");
-+            // And the physical meaning: render pixels for the motion at that render pixel's centre.
-+            const auto expected = field((x + 0.5f) / sx, (y + 0.5f) / sy);
-+            expect(std::fabs(got.x / sx - expected.x) <= 0.011f && std::fabs(got.y / sy - expected.y) <= 0.011f,
-+                   "render-resolution motion does not match the display-resolution motion");
-+        }
-+    std::puts("PASS: WARP display-resolution motion downscale (DXIL, offsets, padding, scale, NaN guard)");
++            const float cx = px - outW * 0.5f, cy = py - outH * 0.5f;
++            return Vec { 12.5f - 0.01f * cy, -3.25f + 0.01f * cx };
++        };
++        for (unsigned y = 0; y < outH; ++y)
++            for (unsigned x = 0; x < outW; ++x)
++            {
++                const auto m = field(x + 0.5f, y + 0.5f);
++                display[(y + baseY) * padW + x + baseX] = { m.x / scaleX, m.y / scaleY };
++            }
++        display[baseY * padW + baseX] = { std::numeric_limits<float>::quiet_NaN(), 1 };
++        const auto plan =
++            DlssNr::PlanDenoiseFirstMotion(false, { padW, padH }, baseX, baseY, render, { outW, outH }, scaleX, scaleY);
++        expect(plan.valid && !plan.passthrough, "plan rejected a valid display-resolution frame");
++        const auto out = run(display, padW, padH, plan);
++        expect(out[0].x == 0 && out[0].y == 0, "non-finite motion was not cleared");
++        const float sx = float(render.width) / outW, sy = float(render.height) / outH;
++        for (unsigned y = 0; y < render.height; ++y)
++            for (unsigned x = 0; x < render.width; ++x)
++            {
++                if (!x && !y)
++                    continue;
++                const auto got = out[y * render.width + x];
++                expect(std::fabs(got.x) < 1000 && std::fabs(got.y) < 1000, "padding outside the region was read");
++                // Bit-for-bit agreement with the CPU model of the texel pick and scale.
++                const auto tx = DlssNr::DisplayMotionSourceTexel(x, render.width, outW, baseX);
++                const auto ty = DlssNr::DisplayMotionSourceTexel(y, render.height, outH, baseY);
++                const auto raw = display[ty * padW + tx];
++                expect(std::fabs(got.x - raw.x * plan.bakeScaleX) <= 1e-4f * std::max(1.0f, std::fabs(got.x)) &&
++                           std::fabs(got.y - raw.y * plan.bakeScaleY) <= 1e-4f * std::max(1.0f, std::fabs(got.y)),
++                       "shader texel pick or scale differs from DlssNr_DisplayMotion.h");
++                // And the physical meaning: render pixels for the motion at that render pixel's centre.
++                const auto expected = field((x + 0.5f) / sx, (y + 0.5f) / sy);
++                expect(std::fabs(got.x / sx - expected.x) <= 0.011f && std::fabs(got.y / sy - expected.y) <= 0.011f,
++                       "render-resolution motion does not match the display-resolution motion");
++            }
++    }
++    std::puts("PASS: WARP display-resolution motion downscale (DXIL, offsets, padding, scale, NaN guard, "
++              "DLAA/Quality/Balanced/Performance/Ultra Performance)");
 +    return 0;
 +}
 +catch (const std::exception& e)

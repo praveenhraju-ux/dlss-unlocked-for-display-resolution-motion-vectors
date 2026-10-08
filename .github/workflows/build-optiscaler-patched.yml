@@ -2,29 +2,46 @@ name: Build patched OptiScaler (DLSS-NR denoise first, display-res MV)
 
 # Builds OptiScaler-DLSSNR-PreSR-Multipass at a pinned commit with the patches in
 # OptiScaler-patches/ applied, runs their regression tests (headless + WARP) and uploads the
-# resulting binaries. Does not publish a release and does not touch the installer workflow.
+# resulting binaries. build-installer.yml calls it and ships the DLL in setup.exe / the zip;
+# this workflow itself never publishes a release.
 on:
   push:
     paths:
       - 'OptiScaler-patches/**'
       - '.github/workflows/build-optiscaler-patched.yml'
   workflow_dispatch:
+  # Called by build-installer.yml so setup.exe and the standalone zip ship the patched DLL.
+  workflow_call:
+    outputs:
+      base_tag:
+        description: Upstream OptiScaler release tag the patches were built on
+        value: ${{ jobs.build.outputs.base_tag }}
+      artifact:
+        description: Name of the uploaded artifact holding OptiScaler.dll
+        value: ${{ jobs.build.outputs.artifact }}
 
 permissions:
   contents: read
 
 env:
   OPTISCALER_REPO: ShyVortex/OptiScaler-DLSSNR-PreSR-Multipass
-  # The commit the patches were written against; bump together with the patches.
-  OPTISCALER_REF: 36ef958381a9ed44d06fc9e6606b41e2d99de3e2
+  # The upstream release the patches were written against (the backend of DLSS Unlocked
+  # NR-v0.9.50-hotfix); bump both together with the patches.
+  OPTISCALER_TAG: v0.9.50
+  OPTISCALER_REF: d5fa05cb92e9667b648d120e9d9b65e09bd2370a
 
 jobs:
   build:
     runs-on: windows-latest
+    outputs:
+      base_tag: ${{ env.OPTISCALER_TAG }}
+      artifact: OptiScaler-denoise-first-display-mv
     steps:
       - uses: actions/checkout@v4
         with:
           path: dlss-unlocked
+          # When called from build-installer.yml, use the same commit as the caller.
+          ref: ${{ github.sha }}
 
       - uses: actions/checkout@v4
         with:
@@ -66,7 +83,8 @@ jobs:
 
       - name: Build OptiScaler (Release x64)
         working-directory: optiscaler
-        run: msbuild /m /p:Configuration=Release . /verbosity:minimal
+        # Same invocation as upstream package_release.ps1 uses for its release DLL.
+        run: msbuild OptiScaler.sln /m /p:Configuration=Release /p:Platform=x64 /p:PostBuildEventUseInBuild=false /verbosity:minimal
 
       - name: Collect binaries
         shell: pwsh
