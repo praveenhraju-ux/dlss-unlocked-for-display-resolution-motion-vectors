@@ -37,6 +37,11 @@ jobs:
       base_tag: ${{ env.OPTISCALER_TAG }}
       artifact: OptiScaler-denoise-first-display-mv
     steps:
+      # FidelityFX submodules have paths that exceed MAX_PATH under this repository's
+      # long workspace directory; let Windows git create them.
+      - name: Enable git long paths
+        run: git config --system core.longpaths true
+
       - uses: actions/checkout@v4
         with:
           path: dlss-unlocked
