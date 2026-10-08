@@ -110,6 +110,11 @@ jobs:
             $src = $dll.DirectoryName
           }
           Write-Host "Collecting from $src"
+          # Prove the DLL carries the patch: its log text only exists in the patched source.
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path "$src/OptiScaler.dll"))
+          $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+          if ($text.IndexOf('resampled from display resolution') -lt 0) { throw 'OptiScaler.dll does not contain the display-resolution motion patch' }
+          Write-Host 'OptiScaler.dll contains the display-resolution motion patch'
           $out = 'artifact'
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           Copy-Item "$src/*" $out -Recurse -Force
