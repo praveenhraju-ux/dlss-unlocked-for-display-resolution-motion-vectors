@@ -1,0 +1,2 @@
+# OptiScaler patches contain binary hunks; keep their bytes exactly (no CRLF conversion on Windows).
+OptiScaler-patches/*.patch -text

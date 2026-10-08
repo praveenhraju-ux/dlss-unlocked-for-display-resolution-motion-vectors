@@ -38,9 +38,12 @@ jobs:
       artifact: OptiScaler-denoise-first-display-mv
     steps:
       # FidelityFX submodules have paths that exceed MAX_PATH under this repository's
-      # long workspace directory; let Windows git create them.
-      - name: Enable git long paths
-        run: git config --system core.longpaths true
+      # long workspace directory; let Windows git create them. Keep LF line endings so the
+      # patches (which carry binary hunks) and the sources they patch stay byte-exact.
+      - name: Configure git (long paths, no CRLF conversion)
+        run: |
+          git config --system core.longpaths true
+          git config --system core.autocrlf false
 
       - uses: actions/checkout@v4
         with:
