@@ -1,0 +1,86 @@
+name: Build patched OptiScaler (DLSS-NR denoise first, display-res MV)
+
+# Builds OptiScaler-DLSSNR-PreSR-Multipass at a pinned commit with the patches in
+# OptiScaler-patches/ applied, runs their regression tests (headless + WARP) and uploads the
+# resulting binaries. Does not publish a release and does not touch the installer workflow.
+on:
+  push:
+    paths:
+      - 'OptiScaler-patches/**'
+      - '.github/workflows/build-optiscaler-patched.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  OPTISCALER_REPO: ShyVortex/OptiScaler-DLSSNR-PreSR-Multipass
+  # The commit the patches were written against; bump together with the patches.
+  OPTISCALER_REF: 36ef958381a9ed44d06fc9e6606b41e2d99de3e2
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: dlss-unlocked
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.OPTISCALER_REPO }}
+          ref: ${{ env.OPTISCALER_REF }}
+          submodules: true
+          path: optiscaler
+
+      - name: Apply patches
+        working-directory: optiscaler
+        shell: pwsh
+        run: |
+          $patches = Get-ChildItem ../dlss-unlocked/OptiScaler-patches/*.patch | Sort-Object Name
+          if (-not $patches) { throw 'No patches found' }
+          foreach ($p in $patches) {
+            Write-Host "Applying $($p.Name)"
+            git apply --whitespace=nowarn $p.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Patch failed: $($p.Name)" }
+          }
+          git status --short
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Regression tests (display-resolution motion, NR guide metadata)
+        working-directory: optiscaler
+        shell: pwsh
+        run: |
+          ./tests/run_nr_denoise_first_display_motion.ps1
+          $build = Join-Path $env:RUNNER_TEMP 'nr-guides'
+          New-Item -ItemType Directory -Force -Path $build | Out-Null
+          cl.exe /nologo /std:c++20 /EHsc /W4 "/Fo$build/" "/Fe$build/guides.exe" tests/nr_guides_smoke.cpp
+          if ($LASTEXITCODE -ne 0) { throw 'nr_guides_smoke compilation failed' }
+          & "$build/guides.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'nr_guides_smoke failed' }
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Build OptiScaler (Release x64)
+        working-directory: optiscaler
+        run: msbuild /m /p:Configuration=Release . /verbosity:minimal
+
+      - name: Collect binaries
+        shell: pwsh
+        run: |
+          $src = 'optiscaler/x64/Release/a'
+          if (-not (Test-Path "$src/OptiScaler.dll")) { throw "OptiScaler.dll not produced in $src" }
+          $out = 'artifact'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item "$src/*" $out -Recurse -Force
+          Copy-Item dlss-unlocked/OptiScaler-patches/README.md "$out/README-display-mv-patch.md"
+          Get-FileHash "$out/OptiScaler.dll" -Algorithm SHA256 | Format-List
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OptiScaler-denoise-first-display-mv
+          path: artifact
+          if-no-files-found: error

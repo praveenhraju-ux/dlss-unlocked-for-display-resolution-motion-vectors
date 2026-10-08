@@ -1,0 +1,1222 @@
+From 6f5951d68b0f8758da1b2a4b2435b2b61c8fc73a Mon Sep 17 00:00:00 2001
+From: praveenhraju-ux <praveenrajuh@gmail.com>
+Date: Thu, 8 Oct 2026 20:23:21 +0000
+Subject: [PATCH] feat(dlssnr): denoise first with display-resolution motion
+ vectors (DX12)
+
+Denoise first refused games whose upscaler is created without MVLowRes
+(e.g. Stellar Blade), because its private 1:1 DLSS/RR pass and NR run at
+render resolution. Resample the game's display-resolution vectors into a
+private render-sized RG32F texture each frame instead:
+
+- nearest output texel under each render pixel centre (no edge blending),
+  read from the MV subrect origin over the DLSS output extent
+- values converted to render pixels (MV scale * render / output per axis);
+  the 1:1 pass, private SR step and NR then use MV scale 1 with MVLowRes
+- jitter offsets unchanged; game motion read in its declared state and
+  restored; private copy rests readable and lives in the GPU-retired
+  denoise-first generation
+- the game's own upscaler keeps its original inputs; render-resolution
+  games keep the previous passthrough path
+
+New shader dlssnr_motion_downscale.hlsl (dxc cs_6_0, signed DXIL), planning
+helper DlssNr_DisplayMotion.h, headless unit test and a WARP test that runs
+the shipped DXIL.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KksEgLpWVJEmw2R46xQgz1
+---
+ OptiScaler/OptiScaler.vcxproj                 |   4 +
+ OptiScaler/OptiScaler.vcxproj.filters         |   4 +
+ .../shaders/dlssnr/DlssNr_DisplayMotion.h     |  86 ++++++
+ OptiScaler/shaders/dlssnr/DlssNr_Dx12.cpp     |  20 ++
+ OptiScaler/shaders/dlssnr/DlssNr_Dx12.h       |   4 +
+ .../dlssnr/DlssNr_Dx12_DenoiseFirst.cpp       | 104 +++++--
+ OptiScaler/shaders/dlssnr/DlssNr_Dx12_State.h |   6 +-
+ .../precompile/dlssnr_motion_downscale.hlsl   |  71 +++++
+ .../dlssnr_motion_downscale_Shader.cso        | Bin 0 -> 2396 bytes
+ .../dlssnr_motion_downscale_Shader.h          | 131 +++++++++
+ docs/NR-MOTION-METADATA.md                    |  11 +
+ .../nr_denoise_first_display_motion_unit.cpp  | 175 ++++++++++++
+ .../nr_denoise_first_display_motion_warp.cpp  | 260 ++++++++++++++++++
+ tests/run_nr_denoise_first_display_motion.ps1 |  14 +
+ 14 files changed, 869 insertions(+), 21 deletions(-)
+ create mode 100644 OptiScaler/shaders/dlssnr/DlssNr_DisplayMotion.h
+ create mode 100644 OptiScaler/shaders/dlssnr/precompile/dlssnr_motion_downscale.hlsl
+ create mode 100644 OptiScaler/shaders/dlssnr/precompile/dlssnr_motion_downscale_Shader.cso
+ create mode 100644 OptiScaler/shaders/dlssnr/precompile/dlssnr_motion_downscale_Shader.h
+ create mode 100644 tests/nr_denoise_first_display_motion_unit.cpp
+ create mode 100644 tests/nr_denoise_first_display_motion_warp.cpp
+ create mode 100644 tests/run_nr_denoise_first_display_motion.ps1
+
+diff --git a/OptiScaler/OptiScaler.vcxproj b/OptiScaler/OptiScaler.vcxproj
+index 79fc449..ad2cd0f 100644
+--- a/OptiScaler/OptiScaler.vcxproj
++++ b/OptiScaler/OptiScaler.vcxproj
+@@ -946,6 +946,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
+     <ClCompile Include="dlssnr\DlssNrFeature_Vk_Resources.cpp" />
+     <ClInclude Include="shaders\dlssnr\DlssNr_GpuTime.h" />
+     <ClInclude Include="shaders\dlssnr\DlssNr_Guides.h" />
++    <ClInclude Include="shaders\dlssnr\DlssNr_DisplayMotion.h" />
+     <ClInclude Include="shaders\dlssnr\DlssNr_ResidualPair.h" />
+     <ClInclude Include="shaders\dlssnr\DlssNr_SeamClock.h" />
+     <ClInclude Include="shaders\dlssnr\DlssNr_Spatial.h" />
+@@ -959,6 +960,9 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
+     <ClInclude Include="shaders\dlssnr\precompile\dlssnr_denoise_first_Shader.h" />
+     <None Include="shaders\dlssnr\precompile\dlssnr_denoise_first.hlsl" />
+     <None Include="shaders\dlssnr\precompile\dlssnr_denoise_first_Shader.cso" />
++    <ClInclude Include="shaders\dlssnr\precompile\dlssnr_motion_downscale_Shader.h" />
++    <None Include="shaders\dlssnr\precompile\dlssnr_motion_downscale.hlsl" />
++    <None Include="shaders\dlssnr\precompile\dlssnr_motion_downscale_Shader.cso" />
+     <ClCompile Include="shaders\dlssnr\DlssNr_Dx12_Enlarge.cpp" />
+     <ClCompile Include="shaders\dlssnr\DlssNr_Dx12_Evaluate.cpp" />
+     <ClCompile Include="shaders\dlssnr\DlssNr_Dx12_FinishedCompose.cpp" />
+diff --git a/OptiScaler/OptiScaler.vcxproj.filters b/OptiScaler/OptiScaler.vcxproj.filters
+index e2b1d39..92b07dc 100644
+--- a/OptiScaler/OptiScaler.vcxproj.filters
++++ b/OptiScaler/OptiScaler.vcxproj.filters
+@@ -1662,6 +1662,7 @@
+     <ClCompile Include="shaders\dlssnr\DlssNr_Dx12.cpp"><Filter>Source Files</Filter></ClCompile>
+     <ClInclude Include="shaders\dlssnr\DlssNr_GpuTime.h"><Filter>Header Files</Filter></ClInclude>
+     <ClInclude Include="shaders\dlssnr\DlssNr_Guides.h"><Filter>Header Files</Filter></ClInclude>
++    <ClInclude Include="shaders\dlssnr\DlssNr_DisplayMotion.h"><Filter>Header Files</Filter></ClInclude>
+     <ClInclude Include="shaders\dlssnr\DlssNr_ResidualPair.h"><Filter>Header Files</Filter></ClInclude>
+     <ClInclude Include="shaders\dlssnr\DlssNr_SeamClock.h"><Filter>Header Files</Filter></ClInclude>
+     <ClInclude Include="shaders\dlssnr\DlssNr_Spatial.h"><Filter>Header Files</Filter></ClInclude>
+@@ -1677,6 +1678,9 @@
+     <ClInclude Include="shaders\dlssnr\precompile\dlssnr_denoise_first_Shader.h"><Filter>Header Files</Filter></ClInclude>
+     <None Include="shaders\dlssnr\precompile\dlssnr_denoise_first.hlsl"><Filter>Source Files</Filter></None>
+     <None Include="shaders\dlssnr\precompile\dlssnr_denoise_first_Shader.cso" />
++    <ClInclude Include="shaders\dlssnr\precompile\dlssnr_motion_downscale_Shader.h"><Filter>Header Files</Filter></ClInclude>
++    <None Include="shaders\dlssnr\precompile\dlssnr_motion_downscale.hlsl"><Filter>Source Files</Filter></None>
++    <None Include="shaders\dlssnr\precompile\dlssnr_motion_downscale_Shader.cso" />
+     <ClCompile Include="shaders\dlssnr\DlssNr_Dx12_Enlarge.cpp"><Filter>Source Files</Filter></ClCompile>
+     <ClCompile Include="shaders\dlssnr\DlssNr_Dx12_Evaluate.cpp"><Filter>Source Files</Filter></ClCompile>
+     <ClCompile Include="shaders\dlssnr\DlssNr_Dx12_FinishedCompose.cpp"><Filter>Source Files</Filter></ClCompile>
+diff --git a/OptiScaler/shaders/dlssnr/DlssNr_DisplayMotion.h b/OptiScaler/shaders/dlssnr/DlssNr_DisplayMotion.h
+new file mode 100644
+index 0000000..df0daf2
+--- /dev/null
++++ b/OptiScaler/shaders/dlssnr/DlssNr_DisplayMotion.h
+@@ -0,0 +1,86 @@
++#pragma once
++#include "DlssNr_Guides.h"
++
++#include <algorithm>
++#include <cmath>
++
++// Denoise first with display-resolution motion vectors.
++//
++// The 1:1 pass and NR run on the render-resolution colour, so they need render-resolution motion.
++// A game created without MVLowRes hands DLSS vectors on the output grid, measured in output pixels
++// (after MV scale). Those are resampled onto the render grid by taking, for every render pixel, the
++// output texel under its centre -- never a blend, which would invent motion along object edges --
++// and converting the vector to render pixels. The private passes then see ordinary MVLowRes data:
++// same direction, same on-screen distance, scale 1. Jitter offsets are already in render pixels and
++// pass through unchanged; jittered-MV semantics are preserved because the conversion is linear.
++// The game's own upscaler keeps its original motion texture and parameters.
++namespace DlssNr
++{
++struct DenoiseFirstMotionPlan
++{
++    bool valid = false;
++    // True when the game's vectors are already render-sized and are passed straight through.
++    bool passthrough = false;
++    // Display-sized source region the resample reads (origin + active size); output-sized.
++    GuideRegion source {};
++    // Render-sized target of the resample.
++    GuideExtent target {};
++    // Applied in the resample: game value * scale = render-pixel motion.
++    float bakeScaleX = 1, bakeScaleY = 1;
++    // What the private 1:1 upscaler and NR are told. Passthrough keeps the game's scale.
++    float privateScaleX = 1, privateScaleY = 1;
++    const char* reason = "";
++};
++
++inline float SanitizeMotionScale(float value) { return std::isfinite(value) && value != 0 ? value : 1.0f; }
++
++inline DenoiseFirstMotionPlan PlanDenoiseFirstMotion(bool lowResolutionMotion, GuideExtent motionAllocation,
++                                                     unsigned int motionX, unsigned int motionY, GuideExtent render,
++                                                     GuideExtent output, float mvScaleX, float mvScaleY)
++{
++    DenoiseFirstMotionPlan plan {};
++    mvScaleX = SanitizeMotionScale(mvScaleX);
++    mvScaleY = SanitizeMotionScale(mvScaleY);
++    if (!render.width || !render.height || !output.width || !output.height)
++    {
++        plan.reason = "empty render or output extent";
++        return plan;
++    }
++    if (lowResolutionMotion)
++    {
++        plan.valid = plan.passthrough = true;
++        plan.source = GuideSubrect(motionAllocation, render, motionX, motionY);
++        plan.target = render;
++        plan.privateScaleX = mvScaleX;
++        plan.privateScaleY = mvScaleY;
++        return plan;
++    }
++    if (render.width > output.width || render.height > output.height)
++    {
++        plan.reason = "render extent exceeds the output extent";
++        return plan;
++    }
++    // Display vectors cover the whole output; a clipped allocation would stretch the vectors it has.
++    plan.source = GuideSubrect(motionAllocation, output, motionX, motionY);
++    if (plan.source.width != output.width || plan.source.height != output.height)
++    {
++        plan.reason = "display-resolution motion texture is smaller than the output";
++        return plan;
++    }
++    plan.valid = true;
++    plan.target = render;
++    plan.bakeScaleX = mvScaleX * float(render.width) / float(output.width);
++    plan.bakeScaleY = mvScaleY * float(render.height) / float(output.height);
++    plan.privateScaleX = plan.privateScaleY = 1;
++    return plan;
++}
++
++// The output texel the resample reads for one render pixel, along one axis. Mirrored exactly by
++// dlssnr_motion_downscale.hlsl; the unit test drives both through the same numbers.
++inline unsigned int DisplayMotionSourceTexel(unsigned int renderPixel, unsigned int renderExtent,
++                                             unsigned int sourceExtent, unsigned int sourceOrigin)
++{
++    const float centre = (float(renderPixel) + 0.5f) * float(sourceExtent) / float(renderExtent);
++    return std::min((unsigned int) centre, sourceExtent - 1) + sourceOrigin;
++}
++} // namespace DlssNr
+diff --git a/OptiScaler/shaders/dlssnr/DlssNr_Dx12.cpp b/OptiScaler/shaders/dlssnr/DlssNr_Dx12.cpp
+index 6f6902e..12fbd7c 100644
+--- a/OptiScaler/shaders/dlssnr/DlssNr_Dx12.cpp
++++ b/OptiScaler/shaders/dlssnr/DlssNr_Dx12.cpp
+@@ -9,6 +9,7 @@
+ #include "precompile/dlssnr_spatial_Shader.h"
+ #include "precompile/dlssnr_spatial_guides_Shader.h"
+ #include "precompile/dlssnr_denoise_first_Shader.h"
++#include "precompile/dlssnr_motion_downscale_Shader.h"
+ 
+ namespace
+ {
+@@ -385,6 +386,11 @@ DlssNr_Dx12::~DlssNr_Dx12()
+         _denoiseFirstPipelineState->Release();
+         _denoiseFirstPipelineState = nullptr;
+     }
++    if (_motionDownscalePipelineState != nullptr)
++    {
++        _motionDownscalePipelineState->Release();
++        _motionDownscalePipelineState = nullptr;
++    }
+ }
+ 
+ bool DlssNr_Dx12::DispatchDenoiseFirstPass(ID3D12GraphicsCommandList* cmd, const DlssNrConstants& constants,
+@@ -402,6 +408,20 @@ bool DlssNr_Dx12::DispatchDenoiseFirstPass(ID3D12GraphicsCommandList* cmd, const
+                            nullptr, nullptr);
+ }
+ 
++bool DlssNr_Dx12::DispatchMotionDownscale(ID3D12GraphicsCommandList* cmd, const DlssNrConstants& constants,
++                                          ID3D12Resource* motion, ID3D12Resource* target)
++{
++    std::lock_guard ownersLock(nrOwnersMutex);
++    std::lock_guard stateLock(_state->mutex);
++    if (!_motionDownscalePipelineState && _init)
++        CreateComputePipeline(_device, &_motionDownscalePipelineState, dlssnr_motion_downscale_cso,
++                              sizeof(dlssnr_motion_downscale_cso), nullptr);
++    if (!_motionDownscalePipelineState)
++        return false;
++    return DispatchCompute(cmd, constants, _motionDownscalePipelineState, motion, nullptr, nullptr, nullptr, nullptr,
++                           target, nullptr, nullptr);
++}
++
+ DlssNr_Dx12::DenoiseFirstHandoff DlssNr_Dx12::DenoiseFirstBefore(ID3D12GraphicsCommandList* cmd,
+                                                                  NVSDK_NGX_Parameter* params, uint32_t featureFlags,
+                                                                  ID3D12CommandQueue* queue, bool rayReconstruction,
+diff --git a/OptiScaler/shaders/dlssnr/DlssNr_Dx12.h b/OptiScaler/shaders/dlssnr/DlssNr_Dx12.h
+index 022b4c6..8d2747e 100644
+--- a/OptiScaler/shaders/dlssnr/DlssNr_Dx12.h
++++ b/OptiScaler/shaders/dlssnr/DlssNr_Dx12.h
+@@ -67,6 +67,7 @@ class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
+     ID3D12PipelineState* _spatialPipelineState = nullptr;
+     ID3D12PipelineState* _spatialGuidesPipelineState = nullptr;
+     ID3D12PipelineState* _denoiseFirstPipelineState = nullptr;
++    ID3D12PipelineState* _motionDownscalePipelineState = nullptr;
+ 
+     // Caller holds the owner and state locks. All NR compute shaders share this descriptor layout.
+     bool DispatchCompute(ID3D12GraphicsCommandList* cmd, const DlssNrConstants& constants,
+@@ -137,6 +138,9 @@ class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
+     std::string DenoiseStatus();
+     bool DispatchDenoiseFirstPass(ID3D12GraphicsCommandList* cmd, const DlssNrConstants& constants, ID3D12Resource* raw,
+                                   ID3D12Resource* model, ID3D12Resource* clean, ID3D12Resource* target);
++    // Display-resolution motion -> render-resolution motion in render pixels (dlssnr_motion_downscale.hlsl).
++    bool DispatchMotionDownscale(ID3D12GraphicsCommandList* cmd, const DlssNrConstants& constants,
++                                 ID3D12Resource* motion, ID3D12Resource* target);
+ 
+     // Records one pass. Resources that a given mode does not read may be null; a stand-in is bound in
+     // their place so every descriptor in the table is valid.
+diff --git a/OptiScaler/shaders/dlssnr/DlssNr_Dx12_DenoiseFirst.cpp b/OptiScaler/shaders/dlssnr/DlssNr_Dx12_DenoiseFirst.cpp
+index 7099d31..bb61004 100644
+--- a/OptiScaler/shaders/dlssnr/DlssNr_Dx12_DenoiseFirst.cpp
++++ b/OptiScaler/shaders/dlssnr/DlssNr_Dx12_DenoiseFirst.cpp
+@@ -1,5 +1,6 @@
+ ﻿#include "pch.h"
+ #include "DlssNr_Dx12_State.h"
++#include "DlssNr_DisplayMotion.h"
+ 
+ // Denoise first.
+ //
+@@ -146,6 +147,15 @@ auto DlssNr_Dx12::State::DenoiseFirstContext::Allocate(Generation& g) -> bool
+     g.exposure = owner.CreateScratch(g.device, DXGI_FORMAT_R32_FLOAT, 1, 1);
+     if (!g.clean || !g.edited || !g.exposure)
+         return false;
++    // Display-resolution vectors get a render-sized copy for the private passes. It rests readable,
++    // like every other private texture between uses.
++    if (!(g.flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes))
++    {
++        g.motion = owner.CreateScratch(g.device, DXGI_FORMAT_R32G32_FLOAT, g.w, g.h,
++                                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++        if (!g.motion)
++            return false;
++    }
+     g.denoiseTime = std::make_unique<DlssNrGpuTime>(g.device);
+     g.enlargeTime = std::make_unique<DlssNrGpuTime>(g.device);
+     return true;
+@@ -224,15 +234,29 @@ auto DlssNr_Dx12::State::DenoiseFirstContext::Before(ID3D12GraphicsCommandList*
+ 
+     const unsigned flags = (featureFlags ? featureFlags : UInt(source, NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags));
+     const unsigned key = flags & kRebuildFlags;
+-    if (!(flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes))
++    // The 1:1 feature and NR run at render resolution and are created with MVLowRes. Display-resolution
++    // vectors (no MVLowRes) are resampled to a render-sized copy below instead of being read misaligned.
++    // They cover the DLSS output size given at creation, which may be smaller than a padded output.
++    const auto motionDesc = motion->GetDesc();
++    const unsigned createdOutW = UInt(source, NVSDK_NGX_Parameter_OutWidth);
++    const unsigned createdOutH = UInt(source, NVSDK_NGX_Parameter_OutHeight);
++    const bool createdOutput =
++        createdOutW && createdOutH && createdOutW <= outDesc.Width && createdOutH <= outDesc.Height;
++    const auto motionPlan = DlssNr::PlanDenoiseFirstMotion(
++        (flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) != 0, { (unsigned) motionDesc.Width, motionDesc.Height },
++        UInt(source, NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X),
++        UInt(source, NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y), { active->width, active->height },
++        { createdOutput ? createdOutW : (unsigned) outDesc.Width, createdOutput ? createdOutH : outDesc.Height },
++        Float(source, NVSDK_NGX_Parameter_MV_Scale_X, 1), Float(source, NVSDK_NGX_Parameter_MV_Scale_Y, 1));
++    if (!motionPlan.valid || motionDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
++        motionDesc.SampleDesc.Count != 1)
+     {
+-        // The private frame has no motion-vector extent of its own; a 1:1 feature expects render-sized
+-        // motion, and display-sized vectors would be read misaligned.
+         device->Release();
+-        Say("inactive: this game supplies display-resolution motion vectors; the 1:1 pass needs render-resolution "
+-            "ones");
++        Say(std::string("inactive: motion vectors unusable for the 1:1 pass: ") +
++            (motionPlan.valid ? "not a single-sample 2D texture" : motionPlan.reason));
+         return handoff;
+     }
++    const bool displayMotion = !motionPlan.passthrough;
+     const int step = std::clamp(cfg.DlssNrDenoiseFirstStep.value_or_default(), 0, 2);
+     auto rrInputs = rayReconstruction ? DlssNr::PrivateUpscalerDx12::ReadRrInputs(source, active->width, active->height)
+                                       : DlssNr::PrivateRrInputsDx12 {};
+@@ -277,6 +301,11 @@ auto DlssNr_Dx12::State::DenoiseFirstContext::Before(ID3D12GraphicsCommandList*
+         }
+         LOG_INFO("DLSS-NR denoise first: generation {}x{} -> {}x{}, 1:1 pass {}, step {}", current->w, current->h,
+                  current->outW, current->outH, privateRr ? "DLSS RR" : "DLSS SR", StepName(step));
++        if (displayMotion)
++            LOG_INFO("DLSS-NR denoise first: display-resolution motion {}x{} resampled to {}x{} for the 1:1 pass "
++                     "and NR (scale {} x {} -> render pixels); the game's upscaler keeps its own vectors",
++                     motionPlan.source.width, motionPlan.source.height, current->w, current->h, motionPlan.bakeScaleX,
++                     motionPlan.bakeScaleY);
+         if (rayReconstruction && !privateRr)
+             LOG_WARN("DLSS-NR denoise first: the game runs RR but its guide buffers are not readable here; the 1:1 "
+                      "pass falls back to DLSS SR, which does not denoise path tracing");
+@@ -314,17 +343,18 @@ auto DlssNr_Dx12::State::DenoiseFirstContext::Before(ID3D12GraphicsCommandList*
+         info.quality = NVSDK_NGX_PerfQuality_Value_DLAA;
+         info.depthInverted = (flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0;
+         info.jitteredMotion = (flags & NVSDK_NGX_DLSS_Feature_Flags_MVJittered) != 0;
+-        info.lowResolutionMotion = (flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) != 0;
++        info.lowResolutionMotion = true; // the game's own, or the resampled copy of display-sized vectors
+         info.rayReconstruction = g.privateRr;
+         info.roughnessMode = g.rr.roughnessMode;
+         info.hardwareDepth = g.rr.hardwareDepth;
+         info.hdr = hdr;
+         info.autoExposure = autoExposure;
+         g.denoiser = std::make_unique<DlssNr::PrivateUpscalerDx12>(DlssNr::PrivateUpscaler::DLSS);
+-        LOG_INFO("DLSS-NR denoise first: creating 1:1 {} {}x{}, inverted {}, jittered MV {}, low-res MV {}, HDR {}, "
++        LOG_INFO("DLSS-NR denoise first: creating 1:1 {} {}x{}, inverted {}, jittered MV {}, low-res MV {}{}, HDR {}, "
+                  "auto exposure {}",
+                  g.privateRr ? "DLSS RR" : "DLSS SR", g.w, g.h, info.depthInverted, info.jitteredMotion,
+-                 info.lowResolutionMotion, hdr, autoExposure);
++                 info.lowResolutionMotion, displayMotion ? " (resampled from display resolution)" : "", hdr,
++                 autoExposure);
+         if (!g.denoiser->Init(g.device, cmd, info))
+         {
+             g.failed = true;
+@@ -426,21 +456,52 @@ auto DlssNr_Dx12::State::DenoiseFirstContext::Before(ID3D12GraphicsCommandList*
+         (D3D12_RESOURCE_STATES) cfg.ExposureResourceBarrier.value_or(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+     const float preExposure = std::max(Float(source, NVSDK_NGX_Parameter_DLSS_Pre_Exposure, 1), 1e-4f);
+     const float exposureScale = Float(source, NVSDK_NGX_Parameter_DLSS_Exposure_Scale, 1);
++    // Jitter offsets are render pixels in both cases and pass through unchanged.
+     const float jitterX = Float(source, NVSDK_NGX_Parameter_Jitter_Offset_X, 0);
+     const float jitterY = Float(source, NVSDK_NGX_Parameter_Jitter_Offset_Y, 0);
+-    float mvScaleX = Float(source, NVSDK_NGX_Parameter_MV_Scale_X, 1);
+-    float mvScaleY = Float(source, NVSDK_NGX_Parameter_MV_Scale_Y, 1);
+-    if (mvScaleX == 0)
+-        mvScaleX = 1;
+-    if (mvScaleY == 0)
+-        mvScaleY = 1;
++    const float mvScaleX = motionPlan.privateScaleX;
++    const float mvScaleY = motionPlan.privateScaleY;
+     const bool reset = UInt(source, NVSDK_NGX_Parameter_Reset) != 0 || g.reset;
+     const float frameTime = Float(source, NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, 16.67f);
+ 
++    // The motion the private passes read: the game's render-sized vectors, or this frame's resample of
++    // its display-sized ones. The game's texture is read in its declared state and returned to it.
++    const auto gameMotionState = motion == color ? arrival : inputStates.motion;
++    ID3D12Resource* privateMotion = motion;
++    D3D12_RESOURCE_STATES privateMotionState = gameMotionState;
++    if (displayMotion)
++    {
++        DlssNrConstants c {};
++        c.Width = g.w;
++        c.Height = g.h;
++        c.GuideWidth = motionPlan.source.width;
++        c.GuideHeight = motionPlan.source.height;
++        c.ResidualMotionBaseX = motionPlan.source.x;
++        c.ResidualMotionBaseY = motionPlan.source.y;
++        c.MvScaleX = motionPlan.bakeScaleX;
++        c.MvScaleY = motionPlan.bakeScaleY;
++        ScopedNrStateEnvelope envelope(cmd);
++        owner.Barrier(cmd, motion, gameMotionState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++        owner.Barrier(cmd, g.motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++        const bool ok = owner.shader.DispatchMotionDownscale(cmd, c, motion, g.motion);
++        owner.Barrier(cmd, g.motion, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++        owner.Barrier(cmd, motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, gameMotionState);
++        if (!ok)
++        {
++            g.failed = true;
++            Say("display-resolution motion resample failed; use Retry");
++            return handoff;
++        }
++        privateMotion = g.motion;
++        privateMotionState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++    }
++
+     DlssNr::PrivateUpscalerFrameDx12 f {};
+     f.color = { color, arrival };
+     f.depth = { depth, depth == color ? arrival : inputStates.depth };
+-    f.motion = { motion, motion == color ? arrival : inputStates.motion };
++    f.motion = { privateMotion, privateMotionState };
+     if (exposureTexture)
+         f.exposure = { exposureTexture, exposureState };
+     else if (!autoExposure)
+@@ -492,7 +553,7 @@ auto DlssNr_Dx12::State::DenoiseFirstContext::Before(ID3D12GraphicsCommandList*
+     frame.RenderSubrectHeight = g.h;
+     frame.OutputWidth = g.outW;
+     frame.OutputHeight = g.outH;
+-    frame.MotionVectorsLowResolution = (flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) != 0;
++    frame.MotionVectorsLowResolution = true; // NR reads the same render-sized motion as the 1:1 pass
+     frame.DepthInverted = (flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0;
+     frame.ColourIsLinearHdr = hdr && DlssNr::FormatCanHoldLinearHdr(inDesc.Format);
+     frame.Reset = reset;
+@@ -523,9 +584,9 @@ auto DlssNr_Dx12::State::DenoiseFirstContext::Before(ID3D12GraphicsCommandList*
+             }
+         } restore { owner, cmd };
+         restore.Read(depth, depth == color ? arrival : inputStates.depth);
+-        restore.Read(motion, motion == color ? arrival : inputStates.motion);
++        restore.Read(privateMotion, privateMotionState);
+         handoff.modelAttempted = true;
+-        owner.Run(cmd, g.edited, depth, motion, g.edited, frame, queue, &handoff.modelEvaluated);
++        owner.Run(cmd, g.edited, depth, privateMotion, g.edited, frame, queue, &handoff.modelEvaluated);
+     }
+     if (owner.nr.successfulDispatches == before)
+     {
+@@ -550,8 +611,13 @@ auto DlssNr_Dx12::State::DenoiseFirstContext::Before(ID3D12GraphicsCommandList*
+                                         << cfg.DlssNrDenoiseFirstEdit.value_or_default() << " shift "
+                                         << cfg.DlssNrDenoiseFirstShift.value_or_default() << " flip "
+                                         << cfg.DlssNrDenoiseFirstFlipJitter.value_or_default() << " clamp "
+-                                        << cfg.DlssNrDenoiseFirstNeighbourhoodClamp.value_or_default() << '\n';
++                                        << cfg.DlssNrDenoiseFirstNeighbourhoodClamp.value_or_default()
++                                        << " display_motion " << displayMotion << " motion_scale "
++                                        << motionPlan.bakeScaleX << ' ' << motionPlan.bakeScaleY << '\n';
+         owner.pipelineCapture->Copy(cmd, g.device, "clean", g.clean, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++        if (displayMotion)
++            owner.pipelineCapture->Copy(cmd, g.device, "motion_render", g.motion,
++                                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+         owner.pipelineCapture->Copy(cmd, g.device, "nr_clean", g.edited,
+                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+     }
+diff --git a/OptiScaler/shaders/dlssnr/DlssNr_Dx12_State.h b/OptiScaler/shaders/dlssnr/DlssNr_Dx12_State.h
+index d1c8a0d..de21a25 100644
+--- a/OptiScaler/shaders/dlssnr/DlssNr_Dx12_State.h
++++ b/OptiScaler/shaders/dlssnr/DlssNr_Dx12_State.h
+@@ -336,8 +336,10 @@ struct DlssNr_Dx12::State
+             // Scratch. clean: the 1:1 output. edited: a copy of clean that NR edits in place.
+             // composite: raw render + edit (step 2). upscaled: the private SR output (step 1).
+             // exposure: a unit exposure for upscalers that are given none and do not auto-expose.
++            // motion: render-resolution RG32F vectors in render pixels, resampled each frame from the
++            // game's display-resolution vectors (games created without MVLowRes); null otherwise.
+             ID3D12Resource *clean = nullptr, *edited = nullptr, *composite = nullptr, *upscaled = nullptr,
+-                           *exposure = nullptr;
++                           *exposure = nullptr, *motion = nullptr;
+             std::unique_ptr<DlssNr::PrivateUpscalerDx12> denoiser, enlarger;
+             DlssNr::PrivateFeatureCreation denoiserCreation, enlargerCreation;
+             std::unique_ptr<DlssNrGpuTime> denoiseTime, enlargeTime;
+@@ -346,7 +348,7 @@ struct DlssNr_Dx12::State
+             {
+                 denoiser.reset(); // NGX features go before the textures they were last evaluated with.
+                 enlarger.reset();
+-                for (auto* r : { clean, edited, composite, upscaled, exposure })
++                for (auto* r : { clean, edited, composite, upscaled, exposure, motion })
+                     if (r)
+                         r->Release();
+                 if (device)
+diff --git a/OptiScaler/shaders/dlssnr/precompile/dlssnr_motion_downscale.hlsl b/OptiScaler/shaders/dlssnr/precompile/dlssnr_motion_downscale.hlsl
+new file mode 100644
+index 0000000..7806d99
+--- /dev/null
++++ b/OptiScaler/shaders/dlssnr/precompile/dlssnr_motion_downscale.hlsl
+@@ -0,0 +1,71 @@
++// Denoise first: display-resolution motion vectors -> render-resolution motion for the 1:1 pass and NR.
++//
++// Each render pixel takes the output-grid vector under its centre (no blending: a blend across an
++// object edge invents motion that neither surface has) and converts it to render pixels. The host
++// (DlssNr_DisplayMotion.h) computes the scale as MV scale * render / output per axis, so direction is
++// kept and the on-screen distance is unchanged; the private passes are then told MV scale 1.
++//
++// Bindings and the constant block match dlssnr_residual.hlsl so DispatchCompute's descriptor table
++// is reused unchanged. Fields used:
++//   gWidth / gHeight                         render-resolution target size
++//   gGuideWidth / gGuideHeight               active display-resolution motion size
++//   gResidualMotionBaseX / Y                 origin of that region in the game's motion texture
++//   gMvScaleX / gMvScaleY                    game value -> render pixels
++// Rebuild: dxc -T cs_6_0 -E CSMain -O3 -Qstrip_debug -Qstrip_reflect dlssnr_motion_downscale.hlsl
++cbuffer Params : register(b0)
++{
++    uint  gMode;
++    float gWhitePoint;
++    uint  gWidth;
++    uint  gHeight;
++    float gTransferStrength;
++    float gColourStrength;
++    uint  gDebugView;
++    float gMaxRatio;
++    uint  gPassthrough;
++    float gMvScaleX;
++    float gMvScaleY;
++    uint  gGuideWidth;
++    uint  gGuideHeight;
++    uint  gCompareMode;
++    float gCompareSplit;
++    float gCompareZoom;
++    uint  gCompareSwap;
++    uint  gTransfer;
++    float gDebugScale;
++    uint  gReversibleMode;
++    uint  gApplyModel;
++    uint  gReserved;
++    float gResidualScale;
++    uint  gSkinProtection;
++    uint  gShowSkinMask;
++    float gSkinDetail;
++    float gSkinColour;
++    float gEnvironmentDetail;
++    float gEnvironmentColour;
++    float gResidualBlend;
++    uint  gResidualHistoryValid;
++    uint  gResidualMotionBaseX;
++    uint  gResidualMotionBaseY;
++};
++
++Texture2D<float4>   gMotion : register(t0); // the game's display-resolution motion vectors
++RWTexture2D<float2> gTarget : register(u0); // RG32F render-resolution motion, in render pixels
++
++// Mirrors DlssNr::DisplayMotionSourceTexel.
++uint SourceTexel(uint pixel, uint renderExtent, uint sourceExtent, uint origin)
++{
++    const float centre = (float(pixel) + 0.5) * float(sourceExtent) / float(renderExtent);
++    return min(uint(centre), sourceExtent - 1) + origin;
++}
++
++[numthreads(8, 8, 1)]
++void CSMain(uint3 id : SV_DispatchThreadID)
++{
++    if (id.x >= gWidth || id.y >= gHeight)
++        return;
++    const uint2 source = uint2(SourceTexel(id.x, gWidth, gGuideWidth, gResidualMotionBaseX),
++                               SourceTexel(id.y, gHeight, gGuideHeight, gResidualMotionBaseY));
++    const float2 motion = gMotion.Load(int3(source, 0)).xy * float2(gMvScaleX, gMvScaleY);
++    gTarget[id.xy] = all(isfinite(motion)) ? motion : float2(0.0, 0.0);
++}
+diff --git a/OptiScaler/shaders/dlssnr/precompile/dlssnr_motion_downscale_Shader.cso b/OptiScaler/shaders/dlssnr/precompile/dlssnr_motion_downscale_Shader.cso
+new file mode 100644
+index 0000000000000000000000000000000000000000..e12098072ee618fb41a6f84dda73a6c8805c49d6
+GIT binary patch
+literal 2396
+zcmZ8i4^R}>8Q;5IcK2X!S-4a8<bb_iLp7Rq5B~%N%--#ZAlM!P8QY=b9{$O-4df08
+z5p>dB?s5xpt*4R((WFN(i8Eyy)V9V+roH2C%t=Y4Rvj}^2IB>B#u&yLM`oO~Zx2YF
+ze6!zs-=E+6_IuxZ->!4JgTHn1@tsRU2OeI1=GCtrzqRoj4Fo|AItW6+Tm-lR@OHo+
+zz&LRJ5O8gIC5r=nkt%C9+ZJ_o{@M3*SMBp`AF!`oT=2d5zkt%7u&FUrR&!Aq222Ci
+z0)CS83ySK0k`{659-gE{dn#AHcB}hW%_(<<y|%)*0K7ISUU=Dg$Zz_9_#%7gJn!6I
+zS*>nXfYKlW1W<J~DGK0eV0ZA5NecmT1ip+eCY7TB_%O+O*q%TtQL3=`h$cWhm4=)0
+zkOPe(y-DjhlHrI`g~lSBu1YU#?5+qI8NR&xUC31ENLG-cENk3luaT6S{x4rgY~^ST
+z*u0u^jxwc|3gfh=^ubwGgc;3MwDFNDYC=#Yz^Sz`bO{co8c%J%hnYXS!XI?&m|d?S
+z2J6WH7;XgyLdNWBMac-ntEm%FoYO(+(|9CI#8}D(d;jH~Gd!e@{5|{fmg-l1H%_rc
+zjGo3R$34@Je>;-rxX*`8OSNg0HNUf)f^Iq}{l2&>OnfSYYL^PGpc|k${OLGLz?GZz
+zZ$9VFw9HMEFIi=qOEg&<>EHl$B}~-iu50)<P!>qG=F|_xlgrK>#AB@DXz&+O&l9`3
+z;DDux5on3s^J~9PkiC6!hZp|E3T%H^?hMH-A$Z#qyl;i<3(K#Bu#GI%zE}2!vGowV
+zVHRd*;j(dmdj+<)Pu>xh_lt517iEvq3S1J1m5%vy#vR2|aM=}qX|LZL(&k_1ixs%+
+zV}I$aR6HCj3BYB;8hTvH7o~h=;6F1t<&<(PA(*dQ%+v0?32te#v~*OHKQoY*955$E
+z<D*F4sM|bqGdC$^j!C(b7W0gxk8tE;h<FU8S$bYL$sufZx<5*zF<ObTpgxLQ9fMJ|
+ztU)QU5}cW_B_g*8@_LWl;emmy|G-5yjgy^Vgfcr>tR;-KGFVfH^eqZ|7X_bysep0x
+z&J(b94(k-KwsCZt!rJGN0tq6_Bd38Yi~&s36ba%iL`Yfqx4{)!q+lsRrFu{`5FJYy
+z2w8B^_lvmi6gDY|sTNh8Lc*%isQsZ*B=o*k%c&9|(UOTGqAIDx=jrk9VxQqa{{UlQ
+zUZ2sFRUJ}v1)DD*{PHaV5@uc>z_+|ZrKL;#S&;Sx$a6vyZUMKu1Kf89ShF0i4wY*S
+zaT^oM;iaQhXEO#@RcU&BQJ>@+I3K;Jv1bjQ@9BviySTFIa|$s8EXNpP6m>HNc<hXw
+zCenAd8UoViETgm8A-E@kxIG29|E!%kq1T;e5!>4MS&LYJ?_{@9{hpYkg0K^xuHAYm
+zDE2eGnss*iZ9VR`A-0A{5W2xR>(Oco5ig9_)o$;<fw;x>M9}skwc#cHv`>6k@7{U#
+zH?5V{Rjq@^vyuA5Y{T8r<n-mqiT4nvp|Et>N9_8K3eT^UYGmTlZt@vrsQOQL4h|_z
+zTSC2-SnJ_c$M^m5XwItR$Fq064AzcL%p~uJCofOTOuvWZr|MAy>ahkF&GDP&Jw{Dg
+zH(wNpDGm|q*o(FH`G{#K^DBycAd+hcN8U&@_p<@>9yTon^XH7gWeL6vw8Ge4rOk`&
+z!?BJE+3UqRy|CI|jBFaqBJYOCn`~w?n|W)NoOO|FsJMFLuUm3Q+<AN0o|2FKCF6YY
+zpW#x_PXV}OY}VK=VEa7SvmUtxjH2uf$zB0#UxBqhN&{hE5#=4Y?4#ut(Bgg4>U*=~
+zy(#jW2zi%<8xx?x2Fzoral&mLwV2~l?x-8R7UGK&d~siD{4iG3%NKRSCB3nqfR{e*
+zD!Bre49AGL1>5h1J6Fi<qHOvnPd=JLlMH!#3VleC_ao%ZQ0CXJ%m=JrN@(&YIQ2y%
+z?p#$+|2aMef_?;MRPYYzn1f5W*q0@T@)<ql-q>=ZeOUkI*QI}>T$}99cVXfwH>90j
+zcCHD%;hp>JR)(hD=&aiiab=^70Kh?J9-I|%2Dmk=1A0LXb*SPlkK@Dp55Vg8wZNrf
+zzI8SjmSll|z)~*!-*PwU4D6WrYg&c6@VVS94e`a4^_(7ZgB*8(91Vzbwc2m#fY<i^
+zo8T_K(ah<Mbv3=b$>`=xD77tblS^xbb}5jOB{KL(K4e98P?r$y$c*}~cH6ZgLwoX_
+zZEvk>3_%QzE~lOH?O$3^6kxcp{lP(+hVU-UVRRd<&}Jao>(OfzI;fM_2@cuC{(~Z-
+zo)MOK)~GR!72-VG=vBkKvHV4RT|Y%wQ49ofowmQ<8}&HYiN@YEYJW33s<m(Ygx>Ao
+z{;**L`YF99J_T_Uak7N+bEiZp%MU|#_S7t+A1bD|;^Kn-K+q4{R6VAgiTE$+%YV)!
+zZnJ~c_)P65IT2lKK0m20-Amz1ShjIoP2|ASAKFdbBZlizE_jpzB;x6!=8>9UdZ!nC
+zhwZ13K^^#UTJjC)b4qHzk|CpmSrDxmolGw^)5hDdXd7?GM!F>!6pi}}__RXUOKiG>
+N!8_P0792^6{s)vA--!SK
+
+literal 0
+HcmV?d00001
+
+diff --git a/OptiScaler/shaders/dlssnr/precompile/dlssnr_motion_downscale_Shader.h b/OptiScaler/shaders/dlssnr/precompile/dlssnr_motion_downscale_Shader.h
+new file mode 100644
+index 0000000..77a5517
+--- /dev/null
++++ b/OptiScaler/shaders/dlssnr/precompile/dlssnr_motion_downscale_Shader.h
+@@ -0,0 +1,131 @@
++﻿#pragma once
++
++inline static const unsigned char dlssnr_motion_downscale_cso[] = {
++    0x44, 0x58, 0x42, 0x43, 0xe3, 0xa4, 0xfc, 0xe9, 0xcf, 0xac, 0x8b, 0xf6, 0xd5, 0x2d, 0x7e, 0xed, 0xfc, 0x9d, 0x3e,
++    0xf5, 0x01, 0x00, 0x00, 0x00, 0x5c, 0x09, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x38, 0x00, 0x00, 0x00, 0x48, 0x00,
++    0x00, 0x00, 0x58, 0x00, 0x00, 0x00, 0x68, 0x00, 0x00, 0x00, 0x08, 0x01, 0x00, 0x00, 0x24, 0x01, 0x00, 0x00, 0x53,
++    0x46, 0x49, 0x30, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x49, 0x53, 0x47, 0x31,
++    0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x4f, 0x53, 0x47, 0x31, 0x08, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x50, 0x53, 0x56, 0x30, 0x98, 0x00, 0x00, 0x00, 0x34, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x08, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00,
++    0x00, 0x18, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x43, 0x53, 0x4d, 0x61, 0x69, 0x6e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x41,
++    0x53, 0x48, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xd6, 0xde, 0x80, 0xc6, 0x75, 0x44, 0x8f, 0x83, 0x19,
++    0xaf, 0x0c, 0xe2, 0x12, 0xac, 0xb9, 0x43, 0x44, 0x58, 0x49, 0x4c, 0x30, 0x08, 0x00, 0x00, 0x60, 0x00, 0x05, 0x00,
++    0x0c, 0x02, 0x00, 0x00, 0x44, 0x58, 0x49, 0x4c, 0x00, 0x01, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x18, 0x08, 0x00,
++    0x00, 0x42, 0x43, 0xc0, 0xde, 0x21, 0x0c, 0x00, 0x00, 0x03, 0x02, 0x00, 0x00, 0x0b, 0x82, 0x20, 0x00, 0x02, 0x00,
++    0x00, 0x00, 0x13, 0x00, 0x00, 0x00, 0x07, 0x81, 0x23, 0x91, 0x41, 0xc8, 0x04, 0x49, 0x06, 0x10, 0x32, 0x39, 0x92,
++    0x01, 0x84, 0x0c, 0x25, 0x05, 0x08, 0x19, 0x1e, 0x04, 0x8b, 0x62, 0x80, 0x18, 0x45, 0x02, 0x42, 0x92, 0x0b, 0x42,
++    0xc4, 0x10, 0x32, 0x14, 0x38, 0x08, 0x18, 0x4b, 0x0a, 0x32, 0x62, 0x88, 0x48, 0x90, 0x14, 0x20, 0x43, 0x46, 0x88,
++    0xa5, 0x00, 0x19, 0x32, 0x42, 0xe4, 0x48, 0x0e, 0x90, 0x11, 0x23, 0xc4, 0x50, 0x41, 0x51, 0x81, 0x8c, 0xe1, 0x83,
++    0xe5, 0x8a, 0x04, 0x31, 0x46, 0x06, 0x51, 0x18, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x1b, 0x8c, 0xe0, 0xff, 0xff,
++    0xff, 0xff, 0x07, 0x40, 0x02, 0xa8, 0x0d, 0x86, 0xf0, 0xff, 0xff, 0xff, 0xff, 0x03, 0x20, 0x01, 0xd5, 0x06, 0x62,
++    0xf8, 0xff, 0xff, 0xff, 0xff, 0x01, 0x90, 0x00, 0x49, 0x18, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x13, 0x82, 0x60,
++    0x42, 0x20, 0x4c, 0x08, 0x06, 0x00, 0x00, 0x00, 0x00, 0x89, 0x20, 0x00, 0x00, 0x68, 0x00, 0x00, 0x00, 0x32, 0x22,
++    0x88, 0x09, 0x20, 0x64, 0x85, 0x04, 0x13, 0x23, 0xa4, 0x84, 0x04, 0x13, 0x23, 0xe3, 0x84, 0xa1, 0x90, 0x14, 0x12,
++    0x4c, 0x8c, 0x8c, 0x0b, 0x84, 0xc4, 0x4c, 0x10, 0x9c, 0xc1, 0x08, 0x40, 0x09, 0x00, 0x0a, 0xe6, 0x08, 0xc0, 0xa0,
++    0x0c, 0xc3, 0x30, 0x10, 0x31, 0x03, 0x70, 0xd3, 0x70, 0xf9, 0x13, 0xf6, 0x10, 0x92, 0xbf, 0x12, 0xd2, 0x4a, 0x4c,
++    0x7e, 0x71, 0xdb, 0xa8, 0x30, 0x0c, 0xc3, 0x18, 0xe6, 0x08, 0x10, 0x42, 0xee, 0x19, 0x2e, 0x7f, 0xc2, 0x1e, 0x42,
++    0xf2, 0x43, 0xa0, 0x19, 0x16, 0x02, 0x05, 0x49, 0x51, 0x8e, 0x41, 0x19, 0x86, 0x61, 0x18, 0x86, 0x81, 0x96, 0x39,
++    0x82, 0xa0, 0x0c, 0xcd, 0x60, 0x90, 0x53, 0x16, 0x60, 0x50, 0x86, 0x61, 0x30, 0x0c, 0xc3, 0x40, 0x08, 0x2a, 0xc4,
++    0x30, 0x0c, 0x03, 0x49, 0x47, 0x0d, 0x97, 0x3f, 0x61, 0x0f, 0x21, 0xf9, 0xdc, 0x46, 0x15, 0x2b, 0x31, 0xf9, 0xc8,
++    0x6d, 0x23, 0x62, 0x18, 0x86, 0xa1, 0x10, 0xd4, 0xa0, 0x0c, 0x54, 0x1d, 0x35, 0x5c, 0xfe, 0x84, 0x3d, 0x84, 0xe4,
++    0x73, 0x1b, 0x55, 0xac, 0xc4, 0xe4, 0x17, 0xb7, 0x8d, 0x08, 0xc3, 0x30, 0x8c, 0x42, 0x5c, 0x83, 0x32, 0x10, 0x56,
++    0x0c, 0x65, 0x40, 0x86, 0xa1, 0x21, 0x6d, 0x20, 0x60, 0x18, 0x81, 0x30, 0x66, 0x6a, 0x83, 0x71, 0x60, 0x87, 0x70,
++    0x98, 0x87, 0x79, 0x70, 0x03, 0x5a, 0x28, 0x07, 0x7c, 0xa0, 0x87, 0x7a, 0x90, 0x87, 0x72, 0x90, 0x03, 0x52, 0xe0,
++    0x03, 0x7b, 0x28, 0x87, 0x71, 0xa0, 0x87, 0x77, 0x90, 0x07, 0x3e, 0x30, 0x07, 0x76, 0x78, 0x87, 0x70, 0xa0, 0x07,
++    0x36, 0x00, 0x03, 0x3a, 0xf0, 0x03, 0x30, 0xf0, 0x03, 0x3d, 0xd0, 0x83, 0x76, 0x48, 0x07, 0x78, 0x98, 0x87, 0x5f,
++    0xa0, 0x87, 0x7c, 0x80, 0x87, 0x72, 0x40, 0xc1, 0x30, 0x93, 0x18, 0x8c, 0x03, 0x3b, 0x84, 0xc3, 0x3c, 0xcc, 0x83,
++    0x1b, 0xd0, 0x42, 0x39, 0xe0, 0x03, 0x3d, 0xd4, 0x83, 0x3c, 0x94, 0x83, 0x1c, 0x90, 0x02, 0x1f, 0xd8, 0x43, 0x39,
++    0x8c, 0x03, 0x3d, 0xbc, 0x83, 0x3c, 0xf0, 0x81, 0x39, 0xb0, 0xc3, 0x3b, 0x84, 0x03, 0x3d, 0xb0, 0x01, 0x18, 0xd0,
++    0x81, 0x1f, 0x80, 0x81, 0x1f, 0x20, 0xa1, 0xf3, 0xe8, 0x1b, 0x46, 0x10, 0x8c, 0x99, 0xc8, 0x60, 0x1c, 0xd8, 0x21,
++    0x1c, 0xe6, 0x61, 0x1e, 0xdc, 0x40, 0x16, 0x6e, 0x81, 0x16, 0xca, 0x01, 0x1f, 0xe8, 0xa1, 0x1e, 0xe4, 0xa1, 0x1c,
++    0xe4, 0x80, 0x14, 0xf8, 0xc0, 0x1e, 0xca, 0x61, 0x1c, 0xe8, 0xe1, 0x1d, 0xe4, 0x81, 0x0f, 0xcc, 0x81, 0x1d, 0xde,
++    0x21, 0x1c, 0xe8, 0x81, 0x0d, 0xc0, 0x40, 0x0e, 0xfc, 0x00, 0x0c, 0xfc, 0x00, 0x05, 0x21, 0x89, 0x67, 0xa4, 0x40,
++    0x04, 0x30, 0x12, 0x0a, 0x83, 0xc1, 0x18, 0x06, 0xc3, 0x18, 0x8c, 0xc1, 0x30, 0x86, 0x61, 0x30, 0x8c, 0x61, 0x30,
++    0x86, 0x61, 0x30, 0x86, 0xc1, 0x30, 0x0c, 0xc3, 0x18, 0x86, 0x81, 0xc8, 0x29, 0x00, 0x00, 0x13, 0x14, 0x72, 0xc0,
++    0x87, 0x74, 0x60, 0x87, 0x36, 0x68, 0x87, 0x79, 0x68, 0x03, 0x72, 0xc0, 0x87, 0x0d, 0xaf, 0x50, 0x0e, 0x6d, 0xd0,
++    0x0e, 0x7a, 0x50, 0x0e, 0x6d, 0x00, 0x0f, 0x7a, 0x30, 0x07, 0x72, 0xa0, 0x07, 0x73, 0x20, 0x07, 0x6d, 0x90, 0x0e,
++    0x71, 0xa0, 0x07, 0x73, 0x20, 0x07, 0x6d, 0x90, 0x0e, 0x78, 0xa0, 0x07, 0x73, 0x20, 0x07, 0x6d, 0x90, 0x0e, 0x71,
++    0x60, 0x07, 0x7a, 0x30, 0x07, 0x72, 0xd0, 0x06, 0xe9, 0x30, 0x07, 0x72, 0xa0, 0x07, 0x73, 0x20, 0x07, 0x6d, 0x90,
++    0x0e, 0x76, 0x40, 0x07, 0x7a, 0x60, 0x07, 0x74, 0xd0, 0x06, 0xe6, 0x10, 0x07, 0x76, 0xa0, 0x07, 0x73, 0x20, 0x07,
++    0x6d, 0x60, 0x0e, 0x73, 0x20, 0x07, 0x7a, 0x30, 0x07, 0x72, 0xd0, 0x06, 0xe6, 0x60, 0x07, 0x74, 0xa0, 0x07, 0x76,
++    0x40, 0x07, 0x6d, 0xe0, 0x0e, 0x78, 0xa0, 0x07, 0x71, 0x60, 0x07, 0x7a, 0x30, 0x07, 0x72, 0xa0, 0x07, 0x76, 0x40,
++    0x07, 0x43, 0x9e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x86, 0x3c, 0x04, 0x10, 0x00,
++    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x79, 0x16, 0x20, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x18, 0xf2, 0x38, 0x40, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0xe4, 0x81, 0x80,
++    0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x60, 0xc8, 0x23, 0x01, 0x01, 0x10, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0xc0, 0x90, 0xa7, 0x02, 0x02, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x21, 0x0f,
++    0x06, 0x04, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x43, 0x1e, 0x0d, 0x08, 0x00, 0x01, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0xb2, 0x40, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x32, 0x1e, 0x98, 0x14, 0x19, 0x11,
++    0x4c, 0x90, 0x8c, 0x09, 0x26, 0x47, 0xc6, 0x04, 0x43, 0x1a, 0x4a, 0x60, 0x04, 0xa0, 0x20, 0x8a, 0xa1, 0x08, 0x4a,
++    0xa2, 0x10, 0x05, 0x0a, 0x81, 0x9a, 0x11, 0x00, 0x02, 0x67, 0x00, 0x68, 0x9c, 0x01, 0xa0, 0x72, 0x06, 0x00, 0x00,
++    0x79, 0x18, 0x00, 0x00, 0x42, 0x00, 0x00, 0x00, 0x1a, 0x03, 0x4c, 0x90, 0x46, 0x02, 0x13, 0xc4, 0x31, 0x20, 0xc3,
++    0x1b, 0x43, 0x81, 0x93, 0x4b, 0xb3, 0x0b, 0xa3, 0x2b, 0x4b, 0x01, 0x89, 0x71, 0xc1, 0x71, 0x81, 0x71, 0xa1, 0xb9,
++    0xc1, 0xc9, 0x01, 0x41, 0x11, 0xa3, 0xb9, 0x89, 0x89, 0xc1, 0x99, 0xc9, 0x29, 0x4b, 0xd9, 0x10, 0x04, 0x13, 0x84,
++    0x21, 0x99, 0x20, 0x0c, 0xca, 0x06, 0x61, 0x20, 0x26, 0x08, 0xc3, 0xb2, 0x41, 0x18, 0x0c, 0x0a, 0x63, 0x73, 0x13,
++    0x84, 0x81, 0xd9, 0x30, 0x20, 0x09, 0x31, 0x41, 0x00, 0x03, 0x89, 0xc0, 0x04, 0x61, 0x68, 0x26, 0x08, 0x83, 0xb3,
++    0x41, 0x20, 0x9c, 0x0d, 0x09, 0xb1, 0x30, 0x04, 0x31, 0x34, 0xc4, 0xb3, 0x21, 0x80, 0x26, 0x08, 0x63, 0x30, 0x4d,
++    0x10, 0x9a, 0x68, 0xc3, 0x42, 0x48, 0x0c, 0x41, 0x0c, 0xcd, 0x34, 0x4d, 0xcf, 0x86, 0x80, 0x9a, 0x20, 0x94, 0x01,
++    0x35, 0x41, 0x18, 0x9e, 0x0d, 0x08, 0x61, 0x31, 0x04, 0x31, 0x5c, 0xc0, 0x86, 0x00, 0xdb, 0x40, 0x44, 0x55, 0x06,
++    0x4c, 0x10, 0x04, 0x80, 0xc6, 0xd0, 0x54, 0x53, 0x58, 0x9a, 0xdb, 0x04, 0x61, 0x80, 0x36, 0x0c, 0x86, 0x31, 0x6c,
++    0x10, 0x3a, 0x6f, 0x43, 0xb1, 0x71, 0x80, 0xf6, 0x55, 0x61, 0x63, 0xb3, 0x6b, 0x73, 0x49, 0x23, 0x2b, 0x73, 0xa3,
++    0x9b, 0x12, 0x04, 0x55, 0xc8, 0xf0, 0x5c, 0xec, 0xca, 0xe4, 0xe6, 0xd2, 0xde, 0xdc, 0xa6, 0x04, 0x44, 0x13, 0x32,
++    0x3c, 0x17, 0xbb, 0x30, 0x36, 0xbb, 0x32, 0xb9, 0x29, 0x81, 0x51, 0x87, 0x0c, 0xcf, 0x65, 0x0e, 0x2d, 0x8c, 0xac,
++    0x4c, 0xae, 0xe9, 0x8d, 0xac, 0x8c, 0x6d, 0x4a, 0x90, 0x94, 0x21, 0xc3, 0x73, 0x91, 0x2b, 0x9b, 0x7b, 0xab, 0x93,
++    0x1b, 0x2b, 0x9b, 0x9b, 0x12, 0x64, 0x75, 0xc8, 0xf0, 0x5c, 0xca, 0xdc, 0xe8, 0xe4, 0xf2, 0xa0, 0xde, 0xd2, 0xdc,
++    0xe8, 0xe6, 0xa6, 0x04, 0x1f, 0x00, 0x79, 0x18, 0x00, 0x00, 0x51, 0x00, 0x00, 0x00, 0x33, 0x08, 0x80, 0x1c, 0xc4,
++    0xe1, 0x1c, 0x66, 0x14, 0x01, 0x3d, 0x88, 0x43, 0x38, 0x84, 0xc3, 0x8c, 0x42, 0x80, 0x07, 0x79, 0x78, 0x07, 0x73,
++    0x98, 0x71, 0x0c, 0xe6, 0x00, 0x0f, 0xed, 0x10, 0x0e, 0xf4, 0x80, 0x0e, 0x33, 0x0c, 0x42, 0x1e, 0xc2, 0xc1, 0x1d,
++    0xce, 0xa1, 0x1c, 0x66, 0x30, 0x05, 0x3d, 0x88, 0x43, 0x38, 0x84, 0x83, 0x1b, 0xcc, 0x03, 0x3d, 0xc8, 0x43, 0x3d,
++    0x8c, 0x03, 0x3d, 0xcc, 0x78, 0x8c, 0x74, 0x70, 0x07, 0x7b, 0x08, 0x07, 0x79, 0x48, 0x87, 0x70, 0x70, 0x07, 0x7a,
++    0x70, 0x03, 0x76, 0x78, 0x87, 0x70, 0x20, 0x87, 0x19, 0xcc, 0x11, 0x0e, 0xec, 0x90, 0x0e, 0xe1, 0x30, 0x0f, 0x6e,
++    0x30, 0x0f, 0xe3, 0xf0, 0x0e, 0xf0, 0x50, 0x0e, 0x33, 0x10, 0xc4, 0x1d, 0xde, 0x21, 0x1c, 0xd8, 0x21, 0x1d, 0xc2,
++    0x61, 0x1e, 0x66, 0x30, 0x89, 0x3b, 0xbc, 0x83, 0x3b, 0xd0, 0x43, 0x39, 0xb4, 0x03, 0x3c, 0xbc, 0x83, 0x3c, 0x84,
++    0x03, 0x3b, 0xcc, 0xf0, 0x14, 0x76, 0x60, 0x07, 0x7b, 0x68, 0x07, 0x37, 0x68, 0x87, 0x72, 0x68, 0x07, 0x37, 0x80,
++    0x87, 0x70, 0x90, 0x87, 0x70, 0x60, 0x07, 0x76, 0x28, 0x07, 0x76, 0xf8, 0x05, 0x76, 0x78, 0x87, 0x77, 0x80, 0x87,
++    0x5f, 0x08, 0x87, 0x71, 0x18, 0x87, 0x72, 0x98, 0x87, 0x79, 0x98, 0x81, 0x2c, 0xee, 0xf0, 0x0e, 0xee, 0xe0, 0x0e,
++    0xf5, 0xc0, 0x0e, 0xec, 0x30, 0x03, 0x62, 0xc8, 0xa1, 0x1c, 0xe4, 0xa1, 0x1c, 0xcc, 0xa1, 0x1c, 0xe4, 0xa1, 0x1c,
++    0xdc, 0x61, 0x1c, 0xca, 0x21, 0x1c, 0xc4, 0x81, 0x1d, 0xca, 0x61, 0x06, 0xd6, 0x90, 0x43, 0x39, 0xc8, 0x43, 0x39,
++    0x98, 0x43, 0x39, 0xc8, 0x43, 0x39, 0xb8, 0xc3, 0x38, 0x94, 0x43, 0x38, 0x88, 0x03, 0x3b, 0x94, 0xc3, 0x2f, 0xbc,
++    0x83, 0x3c, 0xfc, 0x82, 0x3b, 0xd4, 0x03, 0x3b, 0xb0, 0xc3, 0x0c, 0xc4, 0x21, 0x07, 0x7c, 0x70, 0x03, 0x7a, 0x28,
++    0x87, 0x76, 0x80, 0x87, 0x19, 0xd1, 0x43, 0x0e, 0xf8, 0xe0, 0x06, 0xe4, 0x20, 0x0e, 0xe7, 0xe0, 0x06, 0xf6, 0x10,
++    0x0e, 0xf2, 0xc0, 0x0e, 0xe1, 0x90, 0x0f, 0xef, 0x50, 0x0f, 0xf4, 0x30, 0x83, 0x81, 0xc8, 0x01, 0x1f, 0xdc, 0x40,
++    0x1c, 0xe4, 0xa1, 0x1c, 0xc2, 0x61, 0x1d, 0xdc, 0x40, 0x1c, 0xe4, 0x01, 0x00, 0x00, 0x00, 0x71, 0x20, 0x00, 0x00,
++    0x27, 0x00, 0x00, 0x00, 0x06, 0x60, 0x70, 0xac, 0x09, 0x20, 0x8d, 0x15, 0x40, 0xc3, 0xe5, 0x3b, 0x8f, 0x1f, 0x20,
++    0x0d, 0x10, 0x61, 0x3e, 0x72, 0xdb, 0x76, 0xb0, 0x0d, 0x97, 0xef, 0x3c, 0xbe, 0x10, 0x50, 0x45, 0x41, 0x44, 0xa5,
++    0x03, 0x0c, 0x25, 0x61, 0x00, 0x02, 0xe6, 0x17, 0xb7, 0x6d, 0x06, 0xdb, 0x70, 0xf9, 0xce, 0xe3, 0x0b, 0x01, 0x55,
++    0x14, 0x44, 0x54, 0x3a, 0xc0, 0x50, 0x12, 0x06, 0x20, 0x60, 0x3e, 0x72, 0xdb, 0x86, 0x20, 0x0d, 0x97, 0xef, 0x3c,
++    0xbe, 0x10, 0x11, 0xc0, 0x44, 0x84, 0x40, 0x33, 0x2c, 0x84, 0x0d, 0x60, 0xc3, 0xe5, 0x3b, 0x8f, 0x8f, 0x48, 0xec,
++    0x43, 0x08, 0x08, 0xb0, 0x7c, 0x8b, 0x03, 0x4c, 0x7e, 0x71, 0xdb, 0x26, 0x50, 0x0d, 0x97, 0xef, 0x3c, 0xfe, 0x44,
++    0x5c, 0x13, 0x15, 0x11, 0xa5, 0x03, 0x0c, 0x7e, 0x71, 0xdb, 0x46, 0x60, 0x0d, 0x97, 0xef, 0x3c, 0xfe, 0x44, 0x5c,
++    0x13, 0x15, 0x11, 0xec, 0xe4, 0x44, 0x84, 0x5f, 0xdc, 0xb6, 0x05, 0x48, 0xc3, 0xe5, 0x3b, 0x8f, 0x3f, 0x1d, 0x11,
++    0x01, 0x0c, 0xe2, 0xe0, 0x23, 0xb7, 0x0d, 0x00, 0x61, 0x20, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x13, 0x04, 0x44,
++    0x2c, 0x10, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x34, 0x94, 0xdd, 0x0c, 0x40, 0xc9, 0x95, 0x6e, 0x40, 0x0d,
++    0x14, 0x54, 0x51, 0x94, 0x43, 0x19, 0x14, 0x61, 0x40, 0x19, 0x06, 0x10, 0x52, 0x1e, 0x45, 0x50, 0x02, 0x23, 0x00,
++    0x64, 0x8c, 0x00, 0x8c, 0x11, 0x80, 0x20, 0x08, 0xc2, 0x1f, 0x00, 0x23, 0x06, 0x09, 0x00, 0x82, 0x60, 0xa0, 0x79,
++    0x0f, 0xc1, 0x71, 0xd5, 0x88, 0x41, 0x02, 0x80, 0x20, 0x18, 0x68, 0x1f, 0x44, 0x74, 0x9d, 0x35, 0x62, 0x90, 0x00,
++    0x20, 0x08, 0x06, 0x1a, 0x18, 0x44, 0x87, 0xe7, 0x5d, 0x23, 0x06, 0x06, 0x00, 0x82, 0x60, 0x40, 0xa0, 0x41, 0xf4,
++    0x8d, 0x18, 0x18, 0x00, 0x08, 0x82, 0x01, 0x91, 0x06, 0x52, 0x18, 0x8c, 0x18, 0x1c, 0x00, 0x08, 0x82, 0x41, 0x55,
++    0x06, 0xd6, 0x10, 0x06, 0xa3, 0x09, 0x81, 0x30, 0xdc, 0x40, 0x04, 0x64, 0x30, 0xcb, 0x10, 0x0c, 0xc1, 0x68, 0xc2,
++    0x30, 0x0c, 0x37, 0x14, 0x01, 0x19, 0xcc, 0x32, 0x08, 0x43, 0x30, 0x62, 0x70, 0x00, 0x20, 0x08, 0x06, 0x95, 0x1a,
++    0x6c, 0x08, 0x35, 0x9a, 0x10, 0x0c, 0x23, 0x06, 0x07, 0x00, 0x82, 0x60, 0x50, 0xb1, 0x41, 0xa7, 0x94, 0xc1, 0x68,
++    0x42, 0x30, 0xdc, 0x62, 0x94, 0x05, 0x10, 0x7c, 0x6e, 0x30, 0xca, 0x02, 0x41, 0x3e, 0xc7, 0x18, 0x65, 0x42, 0x40,
++    0x9f, 0x3a, 0xc2, 0x00, 0x4e, 0x18, 0x66, 0xc4, 0xe0, 0x00, 0x40, 0x10, 0x0c, 0xa4, 0x3b, 0x10, 0x83, 0x40, 0xa8,
++    0x80, 0x81, 0x11, 0x83, 0x03, 0x00, 0x41, 0x30, 0xa8, 0xf0, 0x20, 0x0d, 0xac, 0x39, 0x18, 0x4d, 0x08, 0x80, 0x11,
++    0x83, 0x03, 0x00, 0x41, 0x30, 0xa8, 0xf4, 0x60, 0x0d, 0xb0, 0x31, 0x18, 0x4d, 0x08, 0x80, 0xc3, 0x8c, 0xb2, 0xc0,
++    0x83, 0xcf, 0x0d, 0x46, 0x59, 0x20, 0xc8, 0xe7, 0x30, 0xa3, 0x4c, 0x08, 0xe8, 0x53, 0xc7, 0x1b, 0xc0, 0x09, 0xc3,
++    0x8c, 0x18, 0x1c, 0x00, 0x08, 0x82, 0x81, 0x54, 0x0a, 0x70, 0x10, 0x08, 0x15, 0x30, 0x30, 0x62, 0xd0, 0x00, 0x20,
++    0x08, 0x06, 0x8b, 0x2a, 0xb8, 0x41, 0x19, 0x88, 0xc2, 0x13, 0xd8, 0x81, 0x1d, 0xd8, 0x81, 0x1d, 0x8c, 0x26, 0x04,
++    0xc0, 0x68, 0x82, 0x10, 0x8c, 0x18, 0x1c, 0x00, 0x08, 0x82, 0x01, 0x86, 0x0a, 0x7a, 0x70, 0x06, 0xa2, 0x30, 0x9a,
++    0x10, 0x04, 0xa3, 0x09, 0x82, 0x60, 0x42, 0x21, 0x1f, 0x13, 0x0a, 0xf9, 0x8c, 0x18, 0x18, 0x00, 0x08, 0x82, 0x81,
++    0x13, 0x0b, 0x79, 0x20, 0x8c, 0x18, 0x18, 0x00, 0x08, 0x82, 0x81, 0x23, 0x0b, 0x7a, 0x20, 0x94, 0x10, 0xe8, 0x74,
++    0x43, 0x31, 0x07, 0xc1, 0x74, 0x43, 0x41, 0x07, 0xc2, 0x88, 0x81, 0x03, 0x80, 0x20, 0x18, 0x40, 0xb5, 0xa0, 0x07,
++    0x73, 0x00, 0x07, 0x6f, 0x30, 0x0a, 0x42, 0x20, 0x08, 0x79, 0x30, 0x4b, 0x30, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00,
++};
+diff --git a/docs/NR-MOTION-METADATA.md b/docs/NR-MOTION-METADATA.md
+index a83ce6b..78d8015 100644
+--- a/docs/NR-MOTION-METADATA.md
++++ b/docs/NR-MOTION-METADATA.md
+@@ -7,3 +7,14 @@ Depth and motion keep independent origins and valid sizes, bounded by their own
+ DX12/Vulkan scale X and Y independently. Every model pass receives the metadata; DX11/Vulkan-to-DX12 bridges preserve parameter blocks while substituting shared resources. Model history, composition and FG ownership are unchanged.
+ 
+ `tests/nr_guides_smoke.cpp` covers render/output vectors, padded allocations, independent origins, clipping and invalid regions. WARP also checks active-colour copies. These checks do not establish reduced shimmering or native Vulkan gameplay compatibility.
++
++## Denoise first with display-resolution motion vectors (DX12)
++
++Denoise first runs a private 1:1 DLSS/RR pass and NR at render resolution, so both are created with `MVLowRes`. Games whose upscaler is created without `MVLowRes` (output-resolution vectors, e.g. Stellar Blade) used to leave the mode inactive. `DlssNr_Dx12_DenoiseFirst.cpp` now resamples those vectors into a private render-sized RG32F texture each frame (`dlssnr_motion_downscale.hlsl`):
++
++- Each render pixel takes the output texel under its centre (no blending across object edges), read from the motion region's origin and the DLSS output size given at creation (`OutWidth`/`OutHeight`, else the output texture's size). A motion texture that cannot cover that size leaves the mode inactive with a reason instead of stretching.
++- Values are converted to render pixels with `MV scale × render / output` per axis, so direction and on-screen distance are kept. The private passes then use MV scale 1. Jitter offsets are render pixels in both cases and pass through unchanged; jittered vectors stay consistent because the conversion is linear.
++- The game's motion texture is read in its declared state and returned to it. The private copy rests in `NON_PIXEL_SHADER_RESOURCE`, is a UAV only while written, and belongs to the denoise-first generation, so it is freed by the same GPU-lifetime retirement as the 1:1 feature.
++- The game's own upscaler (steps "game upscaler" and "edit onto raw render") keeps its original parameters and motion. Render-resolution games are unchanged: the game's texture and MV scale are passed straight through.
++
++`tests/nr_denoise_first_display_motion_unit.cpp` (headless) and `tests/nr_denoise_first_display_motion_warp.cpp` (runs the shipped DXIL on WARP) cover scale, direction, jitter, offsets, padding, passthrough and the texel pick.
+diff --git a/tests/nr_denoise_first_display_motion_unit.cpp b/tests/nr_denoise_first_display_motion_unit.cpp
+new file mode 100644
+index 0000000..b9a6e8f
+--- /dev/null
++++ b/tests/nr_denoise_first_display_motion_unit.cpp
+@@ -0,0 +1,175 @@
++// Headless regression for denoise first with display-resolution motion vectors (no MVLowRes).
++// No D3D12 or NVIDIA runtime; tests/nr_denoise_first_display_motion_warp.cpp runs the shader itself.
++#include "../OptiScaler/shaders/dlssnr/DlssNr_DisplayMotion.h"
++#include <cassert>
++#include <cmath>
++#include <cstdio>
++#include <limits>
++#include <vector>
++
++using namespace DlssNr;
++
++static bool Near(float a, float b, float tolerance = 1e-4f)
++{
++    return std::fabs(a - b) <= tolerance * std::max(1.0f, std::max(std::fabs(a), std::fabs(b)));
++}
++
++struct Vec
++{
++    float x, y;
++};
++
++// CPU model of dlssnr_motion_downscale.hlsl.
++static std::vector<Vec> Resample(const std::vector<Vec>& display, unsigned stride, const DenoiseFirstMotionPlan& plan)
++{
++    std::vector<Vec> out(plan.target.width * plan.target.height);
++    for (unsigned y = 0; y < plan.target.height; ++y)
++        for (unsigned x = 0; x < plan.target.width; ++x)
++        {
++            const auto sx = DisplayMotionSourceTexel(x, plan.target.width, plan.source.width, plan.source.x);
++            const auto sy = DisplayMotionSourceTexel(y, plan.target.height, plan.source.height, plan.source.y);
++            const auto v = display[sy * stride + sx];
++            Vec m { v.x * plan.bakeScaleX, v.y * plan.bakeScaleY };
++            if (!std::isfinite(m.x) || !std::isfinite(m.y))
++                m = { 0, 0 };
++            out[y * plan.target.width + x] = m;
++        }
++    return out;
++}
++
++int main()
++{
++    // Stellar Blade, DLSS Balanced (58%) at 4K: 2227x1253 -> 3840x2160, display-resolution vectors.
++    const GuideExtent render { 2227, 1253 }, output { 3840, 2160 };
++    for (const auto scale : { Vec { 1, 1 }, Vec { -1, -1 }, Vec { 3840, 2160 }, Vec { -3840, 2160 } })
++    {
++        const auto plan = PlanDenoiseFirstMotion(false, { 3840, 2160 }, 0, 0, render, output, scale.x, scale.y);
++        assert(plan.valid && !plan.passthrough);
++        assert(plan.target.width == render.width && plan.target.height == render.height);
++        assert(plan.source.x == 0 && plan.source.y == 0);
++        assert(plan.source.width == output.width && plan.source.height == output.height);
++        // The private passes see plain render pixels.
++        assert(plan.privateScaleX == 1 && plan.privateScaleY == 1);
++        // Magnitude: the same fraction of the screen, measured on the other grid.
++        const float raw[2] = { 0.01f, -0.0042f };
++        const float displayPixelsX = raw[0] * scale.x, displayPixelsY = raw[1] * scale.y;
++        const float renderPixelsX = raw[0] * plan.bakeScaleX, renderPixelsY = raw[1] * plan.bakeScaleY;
++        assert(Near(renderPixelsX / render.width, displayPixelsX / output.width));
++        assert(Near(renderPixelsY / render.height, displayPixelsY / output.height));
++        // Direction: signs are kept on each axis; the MV scale sign (engine convention) is not lost.
++        assert((renderPixelsX > 0) == (displayPixelsX > 0) && (renderPixelsY > 0) == (displayPixelsY > 0));
++        assert(Near(std::atan2(renderPixelsY / render.height, renderPixelsX / render.width),
++                    std::atan2(displayPixelsY / output.height, displayPixelsX / output.width)));
++    }
++
++    // Jittered vectors: a pure jitter delta of (jx, jy) render pixels arrives on the display grid as
++    // (jx, jy) * output / render and must come back as exactly (jx, jy) render pixels, so the 1:1
++    // feature's MVJittered handling and the unchanged jitter offsets still agree.
++    {
++        const auto plan = PlanDenoiseFirstMotion(false, { 3840, 2160 }, 0, 0, render, output, 1, 1);
++        const float jx = 0.3125f, jy = -0.4444f;
++        const float dx = jx * output.width / render.width, dy = jy * output.height / render.height;
++        assert(Near(dx * plan.bakeScaleX, jx) && Near(dy * plan.bakeScaleY, jy));
++    }
++
++    // Render-resolution vectors keep the existing path exactly: the game's texture and scale.
++    {
++        const auto plan = PlanDenoiseFirstMotion(true, { 2227, 1253 }, 0, 0, render, output, -2227, 1253);
++        assert(plan.valid && plan.passthrough);
++        assert(plan.privateScaleX == -2227 && plan.privateScaleY == 1253);
++        assert(plan.bakeScaleX == 1 && plan.bakeScaleY == 1);
++    }
++    // Same sanitization as before: zero or non-finite MV scale reads as 1.
++    {
++        const float nan = std::numeric_limits<float>::quiet_NaN();
++        auto plan = PlanDenoiseFirstMotion(true, { 2227, 1253 }, 0, 0, render, output, 0, nan);
++        assert(plan.privateScaleX == 1 && plan.privateScaleY == 1);
++        plan = PlanDenoiseFirstMotion(false, { 3840, 2160 }, 0, 0, render, output, nan, 0);
++        assert(plan.valid && Near(plan.bakeScaleX, 2227.0f / 3840) && Near(plan.bakeScaleY, 1253.0f / 2160));
++    }
++
++    // Padded display allocation (and a non-zero origin): only the output-sized region is read.
++    {
++        const auto plan = PlanDenoiseFirstMotion(false, { 4096, 2304 }, 16, 8, render, output, 1, 1);
++        assert(plan.valid && plan.source.x == 16 && plan.source.y == 8);
++        assert(plan.source.width == 3840 && plan.source.height == 2160);
++        for (unsigned x : { 0u, 1u, render.width / 2, render.width - 1 })
++        {
++            const auto t = DisplayMotionSourceTexel(x, render.width, plan.source.width, plan.source.x);
++            assert(t >= 16 && t < 16 + 3840);
++        }
++    }
++    // A display texture that cannot cover the output is rejected, not stretched.
++    assert(!PlanDenoiseFirstMotion(false, { 2227, 1253 }, 0, 0, render, output, 1, 1).valid);
++    assert(!PlanDenoiseFirstMotion(false, { 3840, 2160 }, 1, 0, render, output, 1, 1).valid);
++    // Render larger than output and empty extents are rejected.
++    assert(!PlanDenoiseFirstMotion(false, { 3840, 2160 }, 0, 0, { 3841, 2160 }, output, 1, 1).valid);
++    assert(!PlanDenoiseFirstMotion(false, { 3840, 2160 }, 0, 0, { 0, 0 }, output, 1, 1).valid);
++    // DLAA-sized "display" vectors are a 1:1 copy.
++    {
++        const auto plan = PlanDenoiseFirstMotion(false, { 1920, 1080 }, 0, 0, { 1920, 1080 }, { 1920, 1080 }, 1, 1);
++        assert(plan.valid && plan.bakeScaleX == 1 && plan.bakeScaleY == 1);
++        for (unsigned x = 0; x < 1920; ++x)
++            assert(DisplayMotionSourceTexel(x, 1920, 1920, 0) == x);
++    }
++
++    // Texel selection: in range, monotonic, the texel under the render pixel centre, symmetric at both
++    // edges, for every axis of the common DLSS ratios at 1440p and 4K.
++    for (const auto& [r, o] : { std::pair<unsigned, unsigned> { 2227, 3840 },
++                                { 1253, 2160 },
++                                { 1485, 2560 },
++                                { 835, 1440 },
++                                { 1920, 3840 },
++                                { 1280, 3840 },
++                                { 2560, 3840 },
++                                { 1706, 2560 } })
++    {
++        unsigned previous = 0;
++        for (unsigned x = 0; x < r; ++x)
++        {
++            const auto t = DisplayMotionSourceTexel(x, r, o, 0);
++            assert(t < o && t >= previous);
++            const double centre = (x + 0.5) * double(o) / double(r);
++            assert(t <= centre + 1e-3 && centre < t + 1 + 1e-3);
++            previous = t;
++            const auto mirrored = DisplayMotionSourceTexel(r - 1 - x, r, o, 0);
++            assert(std::abs(int(t + mirrored) - int(o - 1)) <= 1);
++        }
++    }
++
++    // End to end on a synthetic field: a camera pan plus a rotation about the screen centre, given in
++    // display pixels. Every resampled vector equals the analytic motion at that render pixel's centre
++    // to within the half-texel the nearest pick can move, and is in render pixels.
++    {
++        const GuideExtent r { 445, 251 }, o { 768, 432 }; // Balanced proportions, small enough to sweep
++        std::vector<Vec> display(o.width * o.height);
++        const float panX = 12.5f, panY = -3.25f, spin = 0.01f;
++        auto field = [&](float px, float py) // display pixels at display position
++        {
++            const float cx = px - o.width * 0.5f, cy = py - o.height * 0.5f;
++            return Vec { panX - spin * cy, panY + spin * cx };
++        };
++        for (unsigned y = 0; y < o.height; ++y)
++            for (unsigned x = 0; x < o.width; ++x)
++                display[y * o.width + x] = field(x + 0.5f, y + 0.5f);
++        display[0] = { std::numeric_limits<float>::infinity(), 0 }; // a corrupt texel becomes zero
++        const auto plan = PlanDenoiseFirstMotion(false, o, 0, 0, r, o, 1, 1);
++        assert(plan.valid);
++        const auto out = Resample(display, o.width, plan);
++        assert(out[0].x == 0 && out[0].y == 0);
++        const float sx = float(r.width) / o.width, sy = float(r.height) / o.height;
++        for (unsigned y = 0; y < r.height; ++y)
++            for (unsigned x = 0; x < r.width; ++x)
++            {
++                if (!x && !y)
++                    continue;
++                const float px = (x + 0.5f) / sx, py = (y + 0.5f) / sy; // render centre on the display grid
++                const auto expected = field(px, py);
++                const auto got = out[y * r.width + x];
++                const float slack = spin * 1.0f + 1e-3f; // one display texel of rotation
++                assert(std::fabs(got.x / sx - expected.x) <= slack && std::fabs(got.y / sy - expected.y) <= slack);
++            }
++    }
++    std::puts("PASS: denoise first display-resolution motion (scale, direction, jitter, offsets, passthrough, "
++              "texel selection, synthetic field)");
++}
+diff --git a/tests/nr_denoise_first_display_motion_warp.cpp b/tests/nr_denoise_first_display_motion_warp.cpp
+new file mode 100644
+index 0000000..7cdac67
+--- /dev/null
++++ b/tests/nr_denoise_first_display_motion_warp.cpp
+@@ -0,0 +1,260 @@
++// WARP executes the shipped dlssnr_motion_downscale DXIL. No game or NVIDIA runtime.
++// Run: tests/run_nr_denoise_first_display_motion.ps1
++#define NOMINMAX
++#include <windows.h>
++#include <d3d12.h>
++#include <dxgi1_4.h>
++#include <wrl/client.h>
++#include <cmath>
++#include <cstddef>
++#include <cstdio>
++#include <cstring>
++#include <limits>
++#include <stdexcept>
++#include <vector>
++#include "../OptiScaler/shaders/dlssnr/DlssNr_Common.h"
++#include "../OptiScaler/shaders/dlssnr/DlssNr_DisplayMotion.h"
++#include "../OptiScaler/shaders/dlssnr/precompile/dlssnr_motion_downscale_Shader.h"
++
++using Microsoft::WRL::ComPtr;
++static void check(HRESULT hr)
++{
++    if (FAILED(hr))
++        throw std::runtime_error("D3D12 call failed");
++}
++static void expect(bool ok, const char* why)
++{
++    if (!ok)
++        throw std::runtime_error(why);
++}
++struct Vec
++{
++    float x, y;
++};
++
++int main()
++try
++{
++    // The HLSL cbuffer reads these fields at these offsets.
++    static_assert(sizeof(DlssNrConstants) == 256);
++    static_assert(offsetof(DlssNrConstants, Width) == 8 && offsetof(DlssNrConstants, Height) == 12);
++    static_assert(offsetof(DlssNrConstants, MvScaleX) == 36 && offsetof(DlssNrConstants, MvScaleY) == 40);
++    static_assert(offsetof(DlssNrConstants, GuideWidth) == 44 && offsetof(DlssNrConstants, GuideHeight) == 48);
++    static_assert(offsetof(DlssNrConstants, ResidualMotionBaseX) == 124 &&
++                  offsetof(DlssNrConstants, ResidualMotionBaseY) == 128);
++
++    ComPtr<IDXGIFactory4> factory;
++    ComPtr<IDXGIAdapter> adapter;
++    ComPtr<ID3D12Device> device;
++    check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
++    check(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)));
++    check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
++
++    // b0, t0, u0 -- the slots the production descriptor table puts first.
++    D3D12_DESCRIPTOR_RANGE ranges[2] {};
++    ranges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0 };
++    ranges[1] = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 1 };
++    D3D12_ROOT_PARAMETER params[2] {};
++    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
++    params[0].Descriptor = { 0, 0 };
++    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    params[1].DescriptorTable = { 2, ranges };
++    D3D12_ROOT_SIGNATURE_DESC rsDesc { 2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE };
++    ComPtr<ID3DBlob> rsBlob, rsErrors;
++    check(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1, &rsBlob, &rsErrors));
++    ComPtr<ID3D12RootSignature> rootSignature;
++    check(device->CreateRootSignature(0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(),
++                                      IID_PPV_ARGS(&rootSignature)));
++    D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc {};
++    psoDesc.pRootSignature = rootSignature.Get();
++    psoDesc.CS = { dlssnr_motion_downscale_cso, sizeof(dlssnr_motion_downscale_cso) };
++    ComPtr<ID3D12PipelineState> pso;
++    check(device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&pso)));
++
++    D3D12_COMMAND_QUEUE_DESC qd { D3D12_COMMAND_LIST_TYPE_DIRECT };
++    ComPtr<ID3D12CommandQueue> queue;
++    check(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)));
++    ComPtr<ID3D12Fence> fence;
++    check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
++    UINT64 fenceValue = 0;
++
++    auto buffer = [&](D3D12_HEAP_TYPE type, UINT64 size, D3D12_RESOURCE_STATES state)
++    {
++        D3D12_HEAP_PROPERTIES heap { type };
++        D3D12_RESOURCE_DESC d {};
++        d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++        d.Width = size;
++        d.Height = d.DepthOrArraySize = d.MipLevels = d.SampleDesc.Count = 1;
++        d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++        ComPtr<ID3D12Resource> r;
++        check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, state, nullptr, IID_PPV_ARGS(&r)));
++        return r;
++    };
++    auto texture = [&](unsigned w, unsigned h, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state)
++    {
++        D3D12_HEAP_PROPERTIES heap { D3D12_HEAP_TYPE_DEFAULT };
++        D3D12_RESOURCE_DESC d {};
++        d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++        d.Width = w;
++        d.Height = h;
++        d.DepthOrArraySize = d.MipLevels = d.SampleDesc.Count = 1;
++        d.Format = DXGI_FORMAT_R32G32_FLOAT;
++        d.Flags = flags;
++        ComPtr<ID3D12Resource> r;
++        check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, state, nullptr, IID_PPV_ARGS(&r)));
++        return r;
++    };
++
++    // Runs the shader the way DenoiseFirstContext::Before does and returns the render-sized result.
++    auto run = [&](const std::vector<Vec>& display, unsigned allocW, unsigned allocH,
++                   const DlssNr::DenoiseFirstMotionPlan& plan)
++    {
++        const unsigned w = plan.target.width, h = plan.target.height;
++        auto source = texture(allocW, allocH, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
++        auto target =
++            texture(w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++        D3D12_PLACED_SUBRESOURCE_FOOTPRINT up {}, down {};
++        UINT64 upSize = 0, downSize = 0;
++        auto sd = source->GetDesc(), td = target->GetDesc();
++        device->GetCopyableFootprints(&sd, 0, 1, 0, &up, nullptr, nullptr, &upSize);
++        device->GetCopyableFootprints(&td, 0, 1, 0, &down, nullptr, nullptr, &downSize);
++        auto upload = buffer(D3D12_HEAP_TYPE_UPLOAD, upSize, D3D12_RESOURCE_STATE_GENERIC_READ);
++        auto readback = buffer(D3D12_HEAP_TYPE_READBACK, downSize, D3D12_RESOURCE_STATE_COPY_DEST);
++        auto constants = buffer(D3D12_HEAP_TYPE_UPLOAD, 256, D3D12_RESOURCE_STATE_GENERIC_READ);
++        unsigned char* mapped = nullptr;
++        check(upload->Map(0, nullptr, (void**) &mapped));
++        for (unsigned y = 0; y < allocH; ++y)
++            std::memcpy(mapped + up.Offset + y * up.Footprint.RowPitch, &display[y * allocW], allocW * sizeof(Vec));
++        upload->Unmap(0, nullptr);
++        DlssNrConstants c {};
++        c.Width = w;
++        c.Height = h;
++        c.GuideWidth = plan.source.width;
++        c.GuideHeight = plan.source.height;
++        c.ResidualMotionBaseX = plan.source.x;
++        c.ResidualMotionBaseY = plan.source.y;
++        c.MvScaleX = plan.bakeScaleX;
++        c.MvScaleY = plan.bakeScaleY;
++        check(constants->Map(0, nullptr, (void**) &mapped));
++        std::memcpy(mapped, &c, sizeof(c));
++        constants->Unmap(0, nullptr);
++
++        D3D12_DESCRIPTOR_HEAP_DESC hd { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
++                                        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
++        ComPtr<ID3D12DescriptorHeap> heap;
++        check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
++        const auto inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++        auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
++        D3D12_SHADER_RESOURCE_VIEW_DESC srv {};
++        srv.Format = DXGI_FORMAT_R32G32_FLOAT;
++        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++        srv.Texture2D.MipLevels = 1;
++        device->CreateShaderResourceView(source.Get(), &srv, cpu);
++        cpu.ptr += inc;
++        D3D12_UNORDERED_ACCESS_VIEW_DESC uav {};
++        uav.Format = DXGI_FORMAT_R32G32_FLOAT;
++        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
++        device->CreateUnorderedAccessView(target.Get(), nullptr, &uav, cpu);
++
++        ComPtr<ID3D12CommandAllocator> allocator;
++        ComPtr<ID3D12GraphicsCommandList> cmd;
++        check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
++        check(
++            device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&cmd)));
++        D3D12_TEXTURE_COPY_LOCATION dst { source.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
++        D3D12_TEXTURE_COPY_LOCATION src { upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
++        src.PlacedFootprint = up;
++        cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
++        auto barrier = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
++        {
++            D3D12_RESOURCE_BARRIER b {};
++            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++            b.Transition = { r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, from, to };
++            cmd->ResourceBarrier(1, &b);
++        };
++        // The production state sequence: game motion read as NON_PIXEL_SHADER_RESOURCE, the private
++        // copy rests readable and is a UAV only while it is written.
++        barrier(source.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++        barrier(target.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++        ID3D12DescriptorHeap* heaps[] = { heap.Get() };
++        cmd->SetDescriptorHeaps(1, heaps);
++        cmd->SetComputeRootSignature(rootSignature.Get());
++        cmd->SetPipelineState(pso.Get());
++        cmd->SetComputeRootConstantBufferView(0, constants->GetGPUVirtualAddress());
++        cmd->SetComputeRootDescriptorTable(1, heap->GetGPUDescriptorHandleForHeapStart());
++        cmd->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
++        barrier(target.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++        barrier(target.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
++        D3D12_TEXTURE_COPY_LOCATION rbDst { readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
++        rbDst.PlacedFootprint = down;
++        D3D12_TEXTURE_COPY_LOCATION rbSrc { target.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
++        cmd->CopyTextureRegion(&rbDst, 0, 0, 0, &rbSrc, nullptr);
++        check(cmd->Close());
++        ID3D12CommandList* lists[] = { cmd.Get() };
++        queue->ExecuteCommandLists(1, lists);
++        check(queue->Signal(fence.Get(), ++fenceValue));
++        HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++        check(fence->SetEventOnCompletion(fenceValue, event));
++        WaitForSingleObject(event, INFINITE);
++        CloseHandle(event);
++        check(device->GetDeviceRemovedReason());
++        std::vector<Vec> out(w * h);
++        check(readback->Map(0, nullptr, (void**) &mapped));
++        for (unsigned y = 0; y < h; ++y)
++            std::memcpy(&out[y * w], mapped + down.Offset + y * down.Footprint.RowPitch, w * sizeof(Vec));
++        readback->Unmap(0, nullptr);
++        return out;
++    };
++
++    // Stellar Blade-shaped case at reduced size (Balanced 58%), padded allocation with an origin,
++    // a pan + rotation field in display pixels, and an engine-style negative Y scale.
++    const unsigned outW = 768, outH = 432, padW = 800, padH = 448, baseX = 16, baseY = 8;
++    const DlssNr::GuideExtent render { 445, 251 };
++    std::vector<Vec> display(padW * padH, Vec { 1e6f, 1e6f }); // padding must never be read
++    const float scaleX = 2.0f, scaleY = -0.5f;                 // raw value * scale = display pixels
++    auto field = [&](float px, float py)
++    {
++        const float cx = px - outW * 0.5f, cy = py - outH * 0.5f;
++        return Vec { 12.5f - 0.01f * cy, -3.25f + 0.01f * cx };
++    };
++    for (unsigned y = 0; y < outH; ++y)
++        for (unsigned x = 0; x < outW; ++x)
++        {
++            const auto m = field(x + 0.5f, y + 0.5f);
++            display[(y + baseY) * padW + x + baseX] = { m.x / scaleX, m.y / scaleY };
++        }
++    display[baseY * padW + baseX] = { std::numeric_limits<float>::quiet_NaN(), 1 };
++    const auto plan =
++        DlssNr::PlanDenoiseFirstMotion(false, { padW, padH }, baseX, baseY, render, { outW, outH }, scaleX, scaleY);
++    expect(plan.valid && !plan.passthrough, "plan rejected a valid display-resolution frame");
++    const auto out = run(display, padW, padH, plan);
++    expect(out[0].x == 0 && out[0].y == 0, "non-finite motion was not cleared");
++    const float sx = float(render.width) / outW, sy = float(render.height) / outH;
++    for (unsigned y = 0; y < render.height; ++y)
++        for (unsigned x = 0; x < render.width; ++x)
++        {
++            if (!x && !y)
++                continue;
++            const auto got = out[y * render.width + x];
++            expect(std::fabs(got.x) < 1000 && std::fabs(got.y) < 1000, "padding outside the region was read");
++            // Bit-for-bit agreement with the CPU model of the texel pick and scale.
++            const auto tx = DlssNr::DisplayMotionSourceTexel(x, render.width, outW, baseX);
++            const auto ty = DlssNr::DisplayMotionSourceTexel(y, render.height, outH, baseY);
++            const auto raw = display[ty * padW + tx];
++            expect(std::fabs(got.x - raw.x * plan.bakeScaleX) <= 1e-4f * std::max(1.0f, std::fabs(got.x)) &&
++                       std::fabs(got.y - raw.y * plan.bakeScaleY) <= 1e-4f * std::max(1.0f, std::fabs(got.y)),
++                   "shader texel pick or scale differs from DlssNr_DisplayMotion.h");
++            // And the physical meaning: render pixels for the motion at that render pixel's centre.
++            const auto expected = field((x + 0.5f) / sx, (y + 0.5f) / sy);
++            expect(std::fabs(got.x / sx - expected.x) <= 0.011f && std::fabs(got.y / sy - expected.y) <= 0.011f,
++                   "render-resolution motion does not match the display-resolution motion");
++        }
++    std::puts("PASS: WARP display-resolution motion downscale (DXIL, offsets, padding, scale, NaN guard)");
++    return 0;
++}
++catch (const std::exception& e)
++{
++    std::fprintf(stderr, "FAIL: %s\n", e.what());
++    return 1;
++}
+diff --git a/tests/run_nr_denoise_first_display_motion.ps1 b/tests/run_nr_denoise_first_display_motion.ps1
+new file mode 100644
+index 0000000..3876e2a
+--- /dev/null
++++ b/tests/run_nr_denoise_first_display_motion.ps1
+@@ -0,0 +1,14 @@
++$ErrorActionPreference = 'Stop'
++$repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
++$build = Join-Path ([System.IO.Path]::GetTempPath()) ('nr-display-motion-' + [guid]::NewGuid())
++New-Item -ItemType Directory -Path $build | Out-Null
++& cl.exe /nologo /std:c++20 /EHsc /W4 /DNOMINMAX "/Fo$build/" "/Fe$build/unit.exe" `
++    "$PSScriptRoot/nr_denoise_first_display_motion_unit.cpp"
++if ($LASTEXITCODE -ne 0) { throw 'Display motion unit compilation failed.' }
++& "$build/unit.exe"
++if ($LASTEXITCODE -ne 0) { throw 'Display motion unit test failed.' }
++& cl.exe /nologo /std:c++20 /EHsc /W4 /DNOMINMAX "/Fo$build/" "/Fe$build/warp.exe" `
++    "$PSScriptRoot/nr_denoise_first_display_motion_warp.cpp" d3d12.lib dxgi.lib
++if ($LASTEXITCODE -ne 0) { throw 'Display motion WARP compilation failed.' }
++& "$build/warp.exe"
++if ($LASTEXITCODE -ne 0) { throw 'Display motion WARP test failed.' }
+-- 
+2.43.0
+

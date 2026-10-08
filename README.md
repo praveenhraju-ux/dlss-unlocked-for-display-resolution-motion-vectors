@@ -75,6 +75,10 @@ This repository automatically tracks and synchronizes with upstream [OptiScaler-
 
 ---
 
+### DLSS-NR Denoise First with display-resolution motion vectors
+
+`OptiScaler-patches/` carries an OptiScaler patch that lets DLSS-NR **Denoise First** run in games that supply display-resolution motion vectors (e.g. Stellar Blade), instead of reporting it as inactive. The **Build patched OptiScaler** workflow builds and tests it. See [`OptiScaler-patches/README.md`](OptiScaler-patches/README.md) for the build, how to drop the resulting `OptiScaler.dll` into a DLSS Unlocked install, and how to verify it in game.
+
 ## 🛠️ Building Locally
 
 To build the standalone package or installer locally:
